@@ -1,0 +1,4 @@
+.venv/
+.pio/
+.pio-core/
+include/secrets.h
