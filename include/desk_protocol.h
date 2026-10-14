@@ -11,6 +11,7 @@ class DeskMonitor {
   uint32_t invalidDisplays = 0, partialTimeouts = 0;
   uint8_t lastFrame[6] = {};
   bool hasFrame = false, hasHeight = false, displayNumeric = false;
+  bool displayHeight = false;
   uint32_t lastFrameMs = 0, lastHeightMs = 0;
   uint32_t heightHundredths = 0;
 
@@ -18,9 +19,16 @@ class DeskMonitor {
     return hasHeight && displayNumeric && uint32_t(now - lastHeightMs) < staleMs;
   }
 
+  bool automaticHeightFresh(uint32_t now) const {
+    return displayHeight && hasHeight && uint32_t(now - lastHeightMs) < 250;
+  }
+
+  void inputOverflow() { displayHeight = false; }
+
   void feed(uint8_t byte, uint32_t now) {
     ++bytes;
     if (used_ && uint32_t(now - lastByteMs_) >= frameGapMs) {
+      displayHeight = false;
       used_ = 0;
       ++partialTimeouts;
     }
@@ -33,6 +41,7 @@ class DeskMonitor {
     lastFrameMs = now;
     const uint8_t sum = buffer_[1] + buffer_[2] + buffer_[3] + buffer_[4];
     if (sum != buffer_[5]) {
+      displayHeight = false;
       ++checksumFailures;
       // Preserve a possible header inside a damaged frame.
       uint8_t next = 1;
@@ -42,6 +51,7 @@ class DeskMonitor {
       return;
     }
     ++validFrames;
+    displayHeight = false;
     uint16_t value = 0;
     int decimal = -1;
     displayNumeric = true;
@@ -60,6 +70,10 @@ class DeskMonitor {
       return;
     }
     heightHundredths = value * (decimal < 0 ? 100 : decimal == 1 ? 10 : 1);
+    displayHeight = (decimal == 1 && heightHundredths >= 6800
+                     && heightHundredths < 10000)
+        || (decimal == -1 && heightHundredths >= 10000
+            && heightHundredths <= 12000);
     hasHeight = true;
     lastHeightMs = now;
   }

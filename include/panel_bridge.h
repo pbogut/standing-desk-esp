@@ -10,6 +10,7 @@ class PanelBridge {
   static constexpr uint32_t frameGapMs = 30, panelTimeoutMs = 250;
   static constexpr uint32_t commandIntervalMs = 10, presetMs = 100;
   static constexpr uint32_t holdLeaseMs = 300, maxHoldMs = 10000;
+  static constexpr uint32_t maxTargetMs = 60000;
   static constexpr uint32_t releaseGapMs = 100;
   uint32_t bytesReceived = 0, bytesForwarded = 0, writeFailures = 0;
   uint32_t bytesSuppressed = 0, espBytesSent = 0;
@@ -17,6 +18,7 @@ class PanelBridge {
   uint32_t lastByteMs = 0;
   uint32_t commandId = 0;
   uint8_t commandButton = 0;
+  const char *stopReason = "idle";
 
   bool fresh(uint32_t now) const {
     return bytesReceived != 0 && uint32_t(now - lastByteMs) < staleMs;
@@ -36,37 +38,56 @@ class PanelBridge {
     if (++commandId == 0) ++commandId;
     commandButton = button;
     hold_ = hold;
+    target_ = false;
+    stopReason = "active";
     startedMs_ = renewedMs_ = now;
     pressSent_ = false;
     return true;
   }
 
   bool renew(uint32_t id, uint8_t button, uint32_t now) {
-    expire(now);
-    if (!commandButton || !hold_ || id != commandId || button != commandButton)
-      return false;
-    renewedMs_ = now;
+    return renewPress(id, button, false, now);
+  }
+
+  bool startTarget(uint8_t button, uint32_t now) {
+    if (!start(button, true, now)) return false;
+    target_ = true;
     return true;
+  }
+
+  bool renewTarget(uint32_t id, uint8_t button, uint32_t now) {
+    return renewPress(id, button, true, now);
   }
 
   bool release(uint32_t id, uint32_t now) {
     if (id == 0 || id != commandId) return false;
-    cancel(now);
+    cancel(now, "released");
     return true;
   }
 
   void inputOverflow(uint32_t now) {
     panelIdle_ = false;
-    cancel(now);
+    cancel(now, "panel_uart_overflow");
   }
 
+ private:
+  bool renewPress(uint32_t id, uint8_t button, bool target, uint32_t now) {
+    expire(now);
+    if (!commandButton || !hold_ || target != target_ || id != commandId
+        || button != commandButton)
+      return false;
+    renewedMs_ = now;
+    return true;
+  }
+
+ public:
   template <typename SerialPort>
   void forward(SerialPort &port, uint32_t now) {
     expire(now);
     if (used_ && uint32_t(now - lastByteMs) >= frameGapMs) {
       ++partialTimeouts;
       panelIdle_ = aligned_ = false;
-      cancel(now);
+      cancel(now, "partial_panel_frame");
       writeBytes(port, frame_, used_, false);
       used_ = 0;
     }
@@ -78,7 +99,7 @@ class PanelBridge {
       lastByteMs = now;
       if (!used_ && byte != 0xA5) {
         panelIdle_ = aligned_ = false;
-        cancel(now);
+        cancel(now, "invalid_panel_frame");
         const uint8_t raw = static_cast<uint8_t>(byte);
         writeBytes(port, &raw, 1, false);
         continue;
@@ -98,31 +119,37 @@ class PanelBridge {
     } else if (commandButton && (!pressSent_
                || uint32_t(now - lastTxMs_) >= commandIntervalMs)) {
       pressSent_ = true;
-      if (!writeCommand(port, commandButton, now)) cancel(now);
+      if (!writeCommand(port, commandButton, now)) cancel(now, "write_failure");
     }
   }
 
  private:
   uint8_t frame_[5] = {}, used_ = 0;
   bool panelIdle_ = false, aligned_ = false, hold_ = false;
+  bool target_ = false;
   bool pressSent_ = false, releasePending_ = false, hasEnded_ = false;
   uint32_t lastFrameMs_ = 0, lastTxMs_ = 0;
   uint32_t startedMs_ = 0, renewedMs_ = 0, endedMs_ = 0;
 
-  void cancel(uint32_t now) {
+  void cancel(uint32_t now, const char *reason) {
     if (!commandButton) return;
     releasePending_ = pressSent_;
     commandButton = 0;
+    stopReason = reason;
     endedMs_ = now;
     hasEnded_ = true;
   }
 
   void expire(uint32_t now) {
     if (!commandButton) return;
-    if (!panelIdle_ || uint32_t(now - lastFrameMs_) >= panelTimeoutMs
-        || (hold_ ? uint32_t(now - renewedMs_) >= holdLeaseMs
-                    || uint32_t(now - startedMs_) >= maxHoldMs
-                  : uint32_t(now - startedMs_) >= presetMs)) cancel(now);
+    if (!panelIdle_ || uint32_t(now - lastFrameMs_) >= panelTimeoutMs)
+      cancel(now, "panel_stale");
+    else if (hold_ && uint32_t(now - renewedMs_) >= holdLeaseMs)
+      cancel(now, "lease_expired");
+    else if (hold_ && uint32_t(now - startedMs_) >= (target_ ? maxTargetMs : maxHoldMs))
+      cancel(now, "travel_timeout");
+    else if (!hold_ && uint32_t(now - startedMs_) >= presetMs)
+      cancel(now, "released");
   }
 
   template <typename SerialPort>
@@ -153,7 +180,7 @@ class PanelBridge {
     if (sum != frame_[4]) {
       ++invalidFrames;
       panelIdle_ = aligned_ = false;
-      cancel(now);
+      cancel(now, "invalid_panel_frame");
       // Forward corrupt bytes unchanged, retaining an embedded candidate header.
       unsigned next = 1;
       while (next < used_ && frame_[next] != 0xA5) ++next;
@@ -167,7 +194,7 @@ class PanelBridge {
     panelIdle_ = frame_[1] == 0 && frame_[2] == 0 && frame_[3] == 0;
     if (!panelIdle_) {
       if (commandButton) ++physicalOverrides;
-      cancel(now);
+      cancel(now, "panel_override");
       // A release before takeover makes even the same preset a new press.
       if (releasePending_) {
         releasePending_ = !writeCommand(port, 0, now);
@@ -182,7 +209,7 @@ class PanelBridge {
         releasePending_ = false;
         endedMs_ = now;
       }
-      if (!ok) cancel(now);
+      if (!ok) cancel(now, "write_failure");
     }
     used_ = 0;
   }
