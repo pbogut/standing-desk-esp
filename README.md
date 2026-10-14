@@ -236,8 +236,9 @@ curl http://192.168.4.1/api/status
 - `remote_button` is `idle`, `up`, `down`, or `preset_1`/`preset_2`/`preset_3`.
   It describes the ESP button press, not whether the desk is physically moving.
 - `remote_command_id` identifies the last accepted ESP command. `remote_ready`
-  means a new command can start: recent idle panel traffic, no active ESP press,
-  and a completed release gap.
+  means a manual command can start: no active ESP press, a completed release gap,
+  and either recent idle panel traffic or a quiet panel. The readiness text is
+  updated on every page poll, separately from the last command's feedback.
 - `hold_lease_ms`, `max_hold_ms`, `preset_press_ms`, and `release_gap_ms` expose
   command timing settings.
 - `automatic_height_valid` requires a clean height layout within 68..120 cm,
@@ -277,10 +278,15 @@ then requires a new press. Releasing the button, hiding the page, or losing focu
 requests release. A physical panel press cancels the ESP command, and later web
 renewals for its old ID are rejected.
 
-Manual UP/DOWN and preset commands do not depend on the display being a fresh
-height. New commands require a checksum-valid idle panel frame within the last
-250 ms. Missing panel traffic, malformed traffic, UART overflow, or an observed
-TX failure cancels ESP control. No ESP command resumes after reboot.
+Manual UP/DOWN and preset commands do not depend on a fresh height or continuous
+panel traffic. The panel stops sending when asleep, so these commands are allowed
+after at least 250 ms of panel silence, or before any panel bytes have arrived.
+The ESP generates the press and release packets itself and continues the press
+without needing panel idle packets. Recent physical presses, corrupt traffic,
+active commands, and pending releases still block new requests. Newly observed
+malformed traffic, UART overflow, or TX failure cancels an active command. A new
+explicit manual request is allowed again after the panel becomes idle or quiet
+and the release gap completes; a cancelled command never resumes by itself.
 
 All control endpoints use `POST` with form fields. Successful responses contain
 `command_id`; invalid arguments return HTTP 400 and conflicts return HTTP 409.
@@ -315,7 +321,9 @@ The ESP chooses UP or DOWN and releases when the displayed height reaches or
 crosses the target. It does not reverse to correct overshoot. If already at the
 requested height, it completes without sending a button press.
 
-Only checksum-valid, recognized height displays qualify:
+Automatic targets still require recent checksum-valid idle panel traffic and a
+fresh height. Sleeping-panel silence does not bypass these checks. Only
+checksum-valid, recognized height displays qualify:
 
 - 68.0 through 99.9 with a decimal point on the second digit.
 - 100 through 120 with no decimal point.
@@ -424,6 +432,9 @@ supply stability still require hardware verification.
 ## First remote-control test
 
 After flashing, check a brief web UP/DOWN hold and release, then a preset click.
+Let the panel sleep and try a manual UP/DOWN request and preset again. They should
+send commands without first waking the panel manually; a target-height request
+should still be refused while the display is unsupported or stale.
 Check that pressing a preset again interrupts travel. During a web hold, press
 any physical panel button and confirm that its action passes through and web
 movement does not resume. Also release a web hold before its start request

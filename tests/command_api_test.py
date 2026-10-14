@@ -209,6 +209,45 @@ int main() {
   assert(statusSerial.available() == 2);
   assert(!target.active() && std::string(target.reason) == "status_backlog");
   assert(panel.commandButton == 0);
+
+  // Sleeping display and panel silence block targets but not manual commands.
+  for (const char *direction : {"up", "down"}) {
+    desk = DeskMonitor(); panel = PanelBridge(); target = TargetMove();
+    panelSerial = FakeSerial(); statusSerial = FakeSerial();
+    now = 0; height(7000); idle(); serviceSerial();
+    statusSerial.input.insert(statusSerial.input.end(), {0x5A, 0xFF, 0xFF, 0xFF, 0, 0xFD});
+    serviceSerial();
+    now = 24000;
+    server.args = {{"height_cm", "80"}};
+    setTarget(); result(409);
+    assert(!desk.automaticHeightFresh(now) && panel.ready(now));
+    server.args = {{"direction", direction}};
+    moveDesk(); result(200);
+    const uint32_t id = panel.commandId;
+    const uint8_t button = direction[0] == 'u' ? 0x20 : 0x40;
+    serviceSerial();
+    assert(panel.commandButton == button);
+    now += 200;
+    server.args = {{"direction", direction}, {"id", std::to_string(id).c_str()}};
+    moveDesk(); result(200);
+    now += 200;
+    moveDesk(); result(200); // Hold continues beyond 250 ms with no panel packets.
+    server.args = {{"id", std::to_string(id).c_str()}};
+    releaseDesk(); result(200);
+    serviceSerial();
+    assert(panel.commandButton == 0);
+  }
+  for (unsigned number = 1; number <= 3; ++number) {
+    panel = PanelBridge(); target = TargetMove();
+    panelSerial = FakeSerial(); statusSerial = FakeSerial();
+    now = 24000;
+    server.args = {{"number", std::to_string(number).c_str()}};
+    pressPreset(); result(200); serviceSerial();
+    assert(panel.commandButton == (1 << number));
+    now += 100; serviceSerial();
+    assert(panel.commandButton == 0);
+    assert(panelSerial.output[panelSerial.output.size() - 3] == 0);
+  }
 }
 '''
 

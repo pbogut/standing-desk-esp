@@ -21,12 +21,12 @@ function element(dataset = {}) {
 
 async function page() {
   const elements = Object.fromEntries(
-    ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state',
+    ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state', 'control-ready',
      'target-form', 'target-height', 'target-submit', 'target-cancel', 'target-state']
       .concat(['wifi-form', 'wifi-ssid', 'wifi-password', 'wifi-save', 'wifi-forget',
                'wifi-state', 'wifi-address', 'wifi-message'])
       .map(id => [id, element()]));
-  elements['control-state'].textContent = 'Connecting controls...';
+  elements['control-ready'].textContent = 'Connecting controls...';
   const presets = [1, 2, 3].map(number => element({preset: String(number)}));
   const moves = ['up', 'down'].map(direction => element({direction}));
   const window = element();
@@ -80,6 +80,30 @@ async function page() {
 }
 
 (async () => {
+  // Readiness always follows firmware status, independently of action feedback.
+  // A sleeping panel can allow manual controls while target movement is blocked.
+  {
+    const client = await page();
+    assert.equal(client.elements['control-ready'].textContent, 'Controls ready');
+    client.elements['control-state'].textContent = 'Previous request failed';
+    client.status.remote_ready = false;
+    await client.poll();
+    assert.equal(client.elements['control-ready'].textContent, 'Controls busy or waiting for panel release');
+    assert.equal(client.elements['control-state'].textContent, 'Previous request failed');
+    Object.assign(client.status, {remote_button: 'up', remote_command_id: 12});
+    await client.poll();
+    assert.equal(client.elements['control-ready'].textContent, 'Remote command active: up');
+    Object.assign(client.status, {remote_ready: true, remote_button: 'idle', panel_fresh: false,
+      fresh: false, state: 'unsupported_display', last_known_height_cm: 70, target_ready: false});
+    await client.poll();
+    assert.equal(client.elements['control-ready'].textContent, 'Controls ready');
+    assert(client.moves.every(button => !button.disabled));
+    assert(client.presets.every(button => !button.disabled));
+    assert(client.elements['target-submit'].disabled);
+    client.offline = true;
+    await client.poll();
+    assert.equal(client.elements['control-ready'].textContent, 'Controls unavailable: monitor unreachable');
+  }
   // Cached height persists across unsupported/stale displays but not ESP restart.
   {
     const client = await page();

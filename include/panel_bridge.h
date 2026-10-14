@@ -25,9 +25,15 @@ class PanelBridge {
   }
 
   bool ready(uint32_t now) const {
-    return commandButton == 0 && !releasePending_ && panelIdle_
-        && uint32_t(now - lastFrameMs_) < panelTimeoutMs
-        && (!hasEnded_ || uint32_t(now - endedMs_) >= releaseGapMs);
+    // A sleeping panel is silent. Recent presses/noise still block new commands.
+    return commandFree(now) && ((panelIdle_
+        && uint32_t(now - lastFrameMs_) < panelTimeoutMs)
+        || bytesReceived == 0 || uint32_t(now - lastByteMs) >= panelTimeoutMs);
+  }
+
+  bool targetReady(uint32_t now) const {
+    return commandFree(now) && panelIdle_
+        && uint32_t(now - lastFrameMs_) < panelTimeoutMs;
   }
 
   bool start(uint8_t button, bool hold, uint32_t now) {
@@ -50,6 +56,8 @@ class PanelBridge {
   }
 
   bool startTarget(uint8_t button, uint32_t now) {
+    expire(now);
+    if (!targetReady(now)) return false;
     if (!start(button, true, now)) return false;
     target_ = true;
     return true;
@@ -71,6 +79,11 @@ class PanelBridge {
   }
 
  private:
+  bool commandFree(uint32_t now) const {
+    return commandButton == 0 && !releasePending_
+        && (!hasEnded_ || uint32_t(now - endedMs_) >= releaseGapMs);
+  }
+
   bool renewPress(uint32_t id, uint8_t button, bool target, uint32_t now) {
     expire(now);
     if (!commandButton || !hold_ || target != target_ || id != commandId
@@ -109,7 +122,7 @@ class PanelBridge {
     }
     // Drain queued physical traffic first. A receive gap also permits release
     // after malformed/truncated traffic, without inserting into its payload.
-    if (port.available() || used_ || (!aligned_
+    if (port.available() || used_ || (bytesReceived && !aligned_
         && uint32_t(now - lastByteMs) < frameGapMs)) return;
     if (releasePending_) {
       if (uint32_t(now - lastTxMs_) >= commandIntervalMs) {
@@ -142,7 +155,7 @@ class PanelBridge {
 
   void expire(uint32_t now) {
     if (!commandButton) return;
-    if (!panelIdle_ || uint32_t(now - lastFrameMs_) >= panelTimeoutMs)
+    if (target_ && (!panelIdle_ || uint32_t(now - lastFrameMs_) >= panelTimeoutMs))
       cancel(now, "panel_stale");
     else if (hold_ && uint32_t(now - renewedMs_) >= holdLeaseMs)
       cancel(now, "lease_expired");

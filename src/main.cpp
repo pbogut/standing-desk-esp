@@ -62,7 +62,8 @@ button[data-direction]{touch-action:none;user-select:none}
 </div>
 <p>Release ends an ESP button press, not automatic preset travel.
 Press a preset again or any physical button to interrupt preset travel.</p>
-<p id="control-state" role="status">Connecting controls...</p>
+<p id="control-ready" role="status">Connecting controls...</p>
+<p id="control-state" role="status"></p>
 <form id="target-form">
 <label for="target-height">Target height, cm</label>
 <input id="target-height" type="number" min="68" max="120" step="1" required disabled>
@@ -92,6 +93,7 @@ const state=document.getElementById('state');
 const diagnostics=document.getElementById('diagnostics');
 const panel=document.getElementById('panel');
 const controlState=document.getElementById('control-state');
+const controlReady=document.getElementById('control-ready');
 const releaseButton=document.getElementById('release');
 const targetForm=document.getElementById('target-form');
 const targetHeight=document.getElementById('target-height');
@@ -314,9 +316,9 @@ async function poll(){
       ? 'Moving '+data.target_direction+' to '+data.target_height_cm+' cm'
       : data.target_state==='idle' ? 'Automatic movement requires a fresh height display.'
       : data.target_state+'. '+data.target_reason.replaceAll('_',' ');
-    if(controlState.textContent==='Connecting controls...'
-       || controlState.textContent==='Waiting for idle panel')
-      controlState.textContent=available ? 'Controls ready' : 'Waiting for idle panel';
+    controlReady.textContent=available ? 'Controls ready'
+      : data.remote_button!=='idle' ? 'Remote command active: '+data.remote_button.replaceAll('_',' ')
+      : 'Controls busy or waiting for panel release';
     remoteId=data.remote_button==='idle' ? null : data.remote_command_id;
     if(hold!==null && hold.id!==null && data.remote_command_id===hold.id
        && data.remote_button==='idle')endHold('Hold ended or physical panel took priority');
@@ -331,6 +333,7 @@ async function poll(){
     remoteId=null;
     endHold('Monitor unreachable');
     controlState.textContent='Monitor unreachable';
+    controlReady.textContent='Controls unavailable: monitor unreachable';
     wifiReady=false;
     wifiAddress.hidden=true;
     wifiState.textContent='Monitor unreachable. Rejoin home Wi-Fi or the backup network.';
@@ -398,7 +401,7 @@ void appendTargetStatus(String &json, uint32_t now) {
   json += desk.automaticHeightFresh(now) ? "true" : "false";
   json += F(",\"target_active\":"); json += target.active() ? "true" : "false";
   json += F(",\"target_ready\":");
-  json += !target.active() && desk.automaticHeightFresh(now) && panel.ready(now) ? "true" : "false";
+  json += !target.active() && desk.automaticHeightFresh(now) && panel.targetReady(now) ? "true" : "false";
   json += F(",\"target_command_id\":"); json += target.commandId;
   json += F(",\"target_height_cm\":");
   json += target.state == TargetMove::State::Idle ? String("null") : String(target.targetHundredths / 100);

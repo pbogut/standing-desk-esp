@@ -80,18 +80,77 @@ int main() {
   bridge.forward(failure, 1030);
   assert(bridge.writeFailures == 1 && bridge.bytesForwarded == forwarded);
 
-  // Commands require recent idle panel traffic and a supported button.
+  // Only supported commands can start; recent physical presses block them.
   {
     PanelBridge remote;
     FakeSerial serial;
-    assert(!remote.start(0x02, false, 0));
+    assert(remote.ready(0) && !remote.targetReady(0));
     idle(remote, serial, 0);
     assert(!remote.start(0x20, false, 0));
     assert(!remote.start(0x02, true, 0));
     assert(!remote.start(0xFF, false, 0));
-    assert(!remote.start(0x02, false, PanelBridge::panelTimeoutMs));
     input(remote, serial, packet(0x40), 300);
     assert(!remote.start(0x02, false, 300));
+  }
+
+  // Sleeping-panel silence permits manual UP/DOWN and presets. Commands repeat
+  // and release without panel input, but automatic mode still requires traffic.
+  for (uint8_t button : {0x02, 0x04, 0x08, 0x20, 0x40}) {
+    PanelBridge remote;
+    FakeSerial serial;
+    idle(remote, serial, 0);
+    serial.output.clear();
+    const bool hold = button == 0x20 || button == 0x40;
+    const uint32_t duration = hold ? PanelBridge::holdLeaseMs : PanelBridge::presetMs;
+    const uint32_t start = 24000;
+    assert(remote.ready(start) && !remote.targetReady(start));
+    assert(!remote.startTarget(0x20, start));
+    assert(remote.start(button, hold, start));
+    std::vector<uint8_t> expected;
+    for (uint32_t elapsed = 0; elapsed < duration; elapsed += 10) {
+      remote.forward(serial, start + elapsed);
+      assert(remote.commandButton == button);
+      expected.push_back(button);
+    }
+    remote.forward(serial, start + duration);
+    expected.push_back(0);
+    expectPackets(serial.output, expected);
+    assert(remote.commandButton == 0);
+    assert(!remote.ready(start + duration + 99));
+    assert(remote.ready(start + duration + 100));
+  }
+
+  // A renewed silent-panel hold runs beyond the old 250 ms panel timeout and
+  // releases explicitly; a waking physical panel still overrides it.
+  {
+    PanelBridge remote;
+    FakeSerial serial;
+    assert(remote.start(0x20, true, 0));
+    remote.forward(serial, 0);
+    expectPackets(serial.output, {0x20});
+    for (uint32_t now = 100; now <= 1000; now += 100) {
+      assert(remote.renew(remote.commandId, 0x20, now));
+      remote.forward(serial, now);
+      assert(remote.commandButton == 0x20);
+    }
+    input(remote, serial, packet(0x04), 1010);
+    assert(remote.commandButton == 0 && remote.physicalOverrides == 1);
+    assert(!remote.renew(remote.commandId, 0x20, 1020));
+    assert(serial.output[serial.output.size() - 3] == 0x04);
+  }
+
+  // New malformed traffic cancels a hold even with no prior panel heartbeat.
+  {
+    PanelBridge remote;
+    FakeSerial serial;
+    assert(remote.start(0x40, true, 0));
+    remote.forward(serial, 0);
+    input(remote, serial, {0xA5, 0, 0, 0, 1}, 10);
+    assert(remote.commandButton == 0 && remote.invalidFrames == 1);
+    assert(!remote.ready(20));
+    remote.forward(serial, 40);
+    assert(remote.ready(260));
+    assert(!remote.targetReady(260));
   }
 
   // Presets repeat at 10 ms, suppress panel idle, then send release at 100 ms.
@@ -223,7 +282,7 @@ int main() {
     assert(remote.bytesReceived == remote.bytesForwarded);
   }
 
-  // UART overflow, missing panel traffic, and write failure cancel commands.
+  // UART overflow, expired leases, and write failure cancel commands.
   {
     PanelBridge remote;
     FakeSerial serial;
@@ -237,11 +296,13 @@ int main() {
     assert(remote.start(0x20, true, 110));
     remote.forward(serial, 110);
     remote.forward(serial, 360);
+    assert(remote.commandButton == 0x20);
+    remote.forward(serial, 410);
     assert(remote.commandButton == 0);
-    idle(remote, serial, 470);
-    assert(remote.start(0x20, true, 470));
+    idle(remote, serial, 520);
+    assert(remote.start(0x20, true, 520));
     serial.failWrite = true;
-    remote.forward(serial, 470);
+    remote.forward(serial, 520);
     assert(remote.commandButton == 0 && remote.writeFailures == 5);
   }
 

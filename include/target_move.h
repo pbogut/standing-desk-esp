@@ -29,7 +29,7 @@ class TargetMove {
     if (heightCm < 68 || heightCm > 120) return "height_cm must be between 68 and 120";
     if (active()) return "An automatic move is already active";
     if (!desk.automaticHeightFresh(now)) return "A fresh clean height display is required";
-    if (!panel.ready(now)) return "Panel must be idle; command busy or release gap active";
+    if (!panel.targetReady(now)) return "Panel must be idle; command busy or release gap active";
     const uint16_t requested = heightCm * 100;
     if (desk.heightHundredths == requested) {
       targetHundredths = requested;

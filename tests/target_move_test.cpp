@@ -175,6 +175,24 @@ int main() {
     assert(f.serial.output[f.serial.output.size() - 3] == 0);
   }
 
+  // Manual sleeping-panel support does not relax automatic panel supervision,
+  // even if the controller continues sending fresh height frames.
+  {
+    Fixture f;
+    f.start(7000, 90);
+    for (uint32_t time : {100, 200}) {
+      f.now = time;
+      f.observe(display(7000));
+      assert(f.target.active());
+    }
+    f.now = 250;
+    f.observe(display(7010));
+    assert(f.desk.automaticHeightFresh(f.now));
+    f.stopped("panel_stale");
+    f.panelFrame();
+    f.stopped("panel_stale");
+  }
+
   // Repeated equal readings are normal, but two seconds without progress cancels.
   for (uint16_t height : {7000, 10500}) {
     Fixture f;
