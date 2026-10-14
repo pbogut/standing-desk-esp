@@ -260,14 +260,18 @@ void serviceSerial() {
   }
   // Check every display frame before transmitting another automatic command.
   // A bad display followed by a valid one in the same batch must still cancel.
-  for (unsigned count = 0; count < 256 && statusSerial.available(); ++count) {
+  unsigned statusBytes = 0;
+  for (; statusBytes < 256 && statusSerial.available(); ++statusBytes) {
     const int byte = statusSerial.read();
     if (byte >= 0) {
       desk.feed(static_cast<uint8_t>(byte), millis());
       target.update(desk, panel, millis());
     }
   }
-  if (statusSerial.available()) target.stop("status_backlog", panel, millis());
+  // Bytes arriving after an empty-buffer observation are normal traffic.
+  // Only an exhausted processing budget with bytes left indicates a backlog.
+  if (statusBytes == 256 && statusSerial.available())
+    target.stop("status_backlog", panel, millis());
   if (statusSerial.overflow()) {
     ++uartOverruns;
     desk.inputOverflow();

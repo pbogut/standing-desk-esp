@@ -38,9 +38,18 @@ struct FakeServer {
 } server;
 struct FakeSerial {
   std::vector<uint8_t> input, output;
+  std::vector<uint8_t> arriveAfterEmpty;
   unsigned position = 0;
   bool overrun = false;
-  int available() { return input.size() - position; }
+  int available() {
+    const int count = input.size() - position;
+    if (!count && !arriveAfterEmpty.empty()) {
+      // Model bytes arriving just after this call observes an empty buffer.
+      input.insert(input.end(), arriveAfterEmpty.begin(), arriveAfterEmpty.end());
+      arriveAfterEmpty.clear();
+    }
+    return count;
+  }
   int read() { return input[position++]; }
   unsigned write(uint8_t byte) { output.push_back(byte); return 1; }
   bool overflow() { bool result = overrun; overrun = false; return result; }
@@ -164,6 +173,42 @@ int main() {
   setTarget(); result(200); serviceSerial();
   now = 800; idle(); serviceSerial(); // Only panel traffic, no new height.
   assert(!target.active() && std::string(target.reason) == "height_stale");
+
+  const auto prepare = []() {
+    desk = DeskMonitor();
+    panel = PanelBridge();
+    target = TargetMove();
+    panelSerial = FakeSerial();
+    statusSerial = FakeSerial();
+    now = 0;
+    height(7000); idle(); serviceSerial();
+    server.args = {{"height_cm", "80"}};
+    setTarget(); result(200); serviceSerial();
+    assert(target.active());
+  };
+  // A new frame arriving after an empty-buffer observation is ordinary traffic,
+  // not a backlog, even if this pass already processed many bytes.
+  for (unsigned received : {0, 6, 252}) {
+    prepare();
+    height(7010);
+    statusSerial.arriveAfterEmpty.assign(statusSerial.input.begin() + statusSerial.position,
+                                         statusSerial.input.end());
+    statusSerial.input.resize(statusSerial.position);
+    for (unsigned i = 0; i < received / 6; ++i) height(7000);
+    serviceSerial();
+    assert(target.active() && panel.commandButton == 0x20);
+    assert(statusSerial.available() == 6);
+    serviceSerial();
+    assert(target.active() && desk.heightHundredths == 7010);
+  }
+  // A genuinely exhausted processing budget still cancels before another press.
+  prepare();
+  for (unsigned i = 0; i < 43; ++i) height(7000);
+  panelSerial.output.clear();
+  serviceSerial();
+  assert(statusSerial.available() == 2);
+  assert(!target.active() && std::string(target.reason) == "status_backlog");
+  assert(panel.commandButton == 0);
 }
 '''
 
