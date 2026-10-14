@@ -1,26 +1,74 @@
-# Standing desk ESP8266 height monitor
+# Standing desk ESP8266 panel bridge
 
-First-stage firmware for a Wemos D1 Mini wired to the desk's RX/TX interface.
-It receives height/status frames at 9600 baud, 8N1 and serves a diagnostics page
-over its own password-protected Wi-Fi access point.
+Firmware for a Wemos D1 Mini placed between the desk controller and original
+panel. It forwards panel commands at 9600 baud, 8N1, reads height/status on a
+separate input, and serves a diagnostics page over its password-protected Wi-Fi
+access point. D5/D6/D7 handle desk traffic; RX/TX remain available for USB.
+
+The web page controls presets 1/2/3 and hold-to-move UP/DOWN. Any physical panel
+button takes priority and cancels the active ESP button press.
 
 ## Wiring
 
-These are the owner's **zero-based contact numbers**, using the plug orientation
-in `standing-desk-esp8266-handoff.md`.
+These are the owner's **zero-based contact numbers**, not standard RJ45 numbers.
+Look at the plug's exposed metal contacts with the plug pointing upward and cable
+exiting downward, then count 0 through 7 from left to right. Identify both adapter
+ends by continuity; looking into a socket can mirror this view.
 
-| Desk contact | Wemos D1 Mini |
-|---|---|
-| 0, controller status output | RX / GPIO3 |
-| 1, controller command input | TX / GPIO1 |
-| 4, ground | GND |
-| 7, 5 V supply | 5V |
+Build a removable inline adapter with a controller side and a panel side:
 
-The firmware uses hardware UART0 in `SERIAL_RX_ONLY` mode, disables serial debug
-output, and makes GPIO1 an input. It does not send idle packets or commands.
-The ESP8266 ROM still sends boot output on GPIO1 before the application starts.
-The onboard USB-to-serial adapter also shares GPIO3. Receive-only firmware cannot
-resolve electrical contention if that adapter drives the line.
+| Contact | Controller-to-panel connection | Wemos D1 Mini connection |
+|---|---|---|
+| 0, controller status output | Straight through to panel contact 0 | Tap to D5 / GPIO14 |
+| 1, panel command output | **Split, no direct connection between the two sides** | Panel side to D6 / GPIO12; controller side to D7 / GPIO13 |
+| 4, ground | Straight through | Tap to GND |
+| 7, 5 V supply | Straight through so the original panel stays powered | Leave untapped for the first USB-powered test |
+| 2, 3, 5, 6 | Preserve each contact straight through | No ESP connection |
+
+```text
+Controller contact 0 --------+-------- Panel contact 0
+                            |
+                            +-------- D5, status input
+
+Controller contact 1 <--------------- D7, command output
+                                      ESP forwards bytes
+Panel contact 1 --------------------> D6, panel input
+
+Controller contact 4 --------+-------- Panel contact 4
+                            +-------- GND
+
+Controller contact 7 ---------------- Panel contact 7
+```
+
+Move the previous GPIO3/RX status connection to D5. Move the previous GPIO1/TX
+controller-command connection to D7, and add the panel-command connection to D6.
+Leave the board's RX and TX pins disconnected from the desk. Never join D7 to
+panel TX; those are two separate outputs.
+
+The UART signals must be 3.3 V compatible. The measured averages in the handoff
+are not confirmation of peak signal voltage; use level shifting if needed.
+An external 10 kOhm pull-up from D7 to 3V3 is recommended to hold the command wire
+at UART idle while the ESP is in reset. Firmware holds it high during application
+startup and starts forwarding after Wi-Fi setup, without queuing startup presses.
+
+For the first test, power the ESP by USB while contact 7 powers only the panel.
+For subsequent desk-powered use, contact 7 can be tapped to the board's **5V** pin
+after confirming the supply supports the ESP's Wi-Fi current peaks. Disconnect
+USB when using that tap unless this board's power isolation has been verified.
+Never connect contact 7 to 3V3.
+
+Both software UART receivers remain active during transmission. The bridge
+buffers five-byte panel frames and forwards idle, movement, preset, and
+programming traffic. While an ESP button is active, panel idle frames are
+suppressed and ESP button frames are sent roughly every 10 ms. Any non-idle panel
+frame cancels ESP control and passes through. Unknown and corrupt traffic also
+passes through; corrupt traffic cancels ESP control. Forwarding adds latency and
+exact packet gaps are not preserved.
+
+Panel buttons require working ESP firmware and are unavailable during boot,
+reset, or flashing. The panel display receives status directly. If the ESP fails,
+remove the whole adapter and reconnect the panel directly to the desk. There is
+no automatic bypass.
 
 ## Build
 
@@ -42,7 +90,7 @@ Create them with the steps above on the laptop too.
 
 ## Flash and connect
 
-1. Unplug the desk's modular cable from the Wemos assembly.
+1. Disconnect the adapter from both the desk and original panel.
 2. Connect the Wemos to your computer through USB.
 3. Find the board's USB serial port:
 
@@ -58,26 +106,36 @@ Create them with the steps above on the laptop too.
    .venv/bin/pio run -t upload --upload-port /dev/ttyUSB0
    ```
 
-4. Disconnect USB, then reconnect the desk cable. The desk now supplies power.
+4. For the first test, keep USB power, leave the ESP's 5V desk tap disconnected,
+   and connect the adapter between the desk and original panel. If later using
+   desk power, disconnect USB before connecting the desk's 5 V tap.
 5. Join the Wi-Fi network named `standing-desk-<chip-id>`. Its password is the
    `apPassword` value in `include/secrets.h`. Accept staying connected to this
    network without internet access if your phone asks.
 6. Open **http://192.168.4.1/**.
 
-Do not open a USB serial monitor for this firmware. GPIO3 is the desk receive
-pin, and GPIO1 is connected to the desk command input. All application diagnostics
-use HTTP. Disconnect the desk cable for subsequent USB uploads as well.
+USB serial is now independent of desk traffic. The optional serial monitor runs
+at 115200 baud and prints a startup message:
+
+```sh
+.venv/bin/pio device monitor --port /dev/ttyUSB0
+```
+
+Opening a monitor may reset the ESP through USB control lines and briefly stop
+panel forwarding. Disconnect the adapter from the desk and panel for uploads.
 
 The compiled image is `.pio/build/d1_mini/firmware.bin`.
 
-### Upload status on the original computer
+### Previous board upload history
 
-The firmware builds and decoder tests pass, but flashing has not succeeded.
-The uploader detects the ESP8266 and starts its RAM helper, then times out before
+The previous board could not be flashed on the original computer.
+The uploader detected the ESP8266 and started its RAM helper, then timed out before
 writing flash blocks. Attempts at 115200 and 57600 baud, the ROM-only path, and
 esptool 4.11.0 also failed. The desk cable was confirmed disconnected. A flash ID
 could not be obtained; this does not establish whether the fault is in the USB
-connection, power, or board. The next test is uploading from the laptop.
+connection, power, or board. This history does not establish a fault in the
+replacement D1 Mini. The bridge firmware builds and its host tests pass; upload
+and physical forwarding still need verification on the replacement.
 
 `platformio.ini` currently sets the upload speed to 57600 baud.
 
@@ -91,8 +149,9 @@ curl http://192.168.4.1/api/status
 
 - `state` is `waiting_for_frames`, `fresh`, `stale`, or `unsupported_display`.
 - `height_cm` is a number only while fresh, otherwise `null`.
-- `last_known_height_cm` retains the last decoded number for troubleshooting.
-  It is historical whenever `fresh` is false.
+- `last_known_height_cm` retains the last decoded number until the ESP restarts.
+  When `fresh` is false, the page shows this value with a `Last known height` label.
+  Before the first height reading, the page shows `No reading`.
 - `height_age_ms` measures time since the last accepted numeric reading. A reading
   becomes stale at 1,000 ms. A checksum-valid, unrecognized display invalidates
   the current reading immediately.
@@ -102,9 +161,29 @@ curl http://192.168.4.1/api/status
   frames, including unrecognized displays. `invalid_displays` counts those
   unrecognized digit codes or invalid decimal layouts.
 - `checksum_failures` and `partial_timeouts` help diagnose framing problems.
-- `uart_overruns` and `uart_errors` count observed UART error flags. They are
-  indicators, not exact counts of lost or damaged bytes.
-- `commands_enabled` is always `false` in this firmware.
+- `uart_overruns` counts observed software-UART overflow flags on D5.
+- `panel_bytes_received` and `panel_bytes_forwarded` count bytes read on D6 and
+  forwarded unchanged on D7. With no web command, they match once buffered bytes
+  have been forwarded. During web commands, idle bytes are counted separately in
+  `panel_bytes_suppressed`. These counts do not prove the desk received them.
+- `esp_bytes_sent` counts generated button/release bytes successfully written on D7.
+- `panel_invalid_frames` and `panel_partial_timeouts` count corrupt panel frames
+  and incomplete frames flushed after a 30 ms receive gap.
+- `physical_overrides` counts non-idle panel frames that cancelled an ESP press.
+- `panel_write_failures` counts unsuccessful byte writes. Expect zero.
+- `panel_uart_overruns` counts observed overflow flags on the panel input. Expect
+  both overflow counters to stay zero. They are not exact counts of lost bytes;
+  software serial does not expose the old hardware `uart_errors` field.
+- `panel_age_ms` is time since the last panel byte was read. `panel_fresh` becomes
+  false after 1,000 ms without bytes; this indicates traffic, not frame validity.
+- `passthrough_enabled` and `commands_enabled` are `true`.
+- `remote_button` is `idle`, `up`, `down`, or `preset_1`/`preset_2`/`preset_3`.
+  It describes the ESP button press, not whether the desk is physically moving.
+- `remote_command_id` identifies the last accepted ESP command. `remote_ready`
+  means a new command can start: recent idle panel traffic, no active ESP press,
+  and a completed release gap.
+- `hold_lease_ms`, `max_hold_ms`, `preset_press_ms`, and `release_gap_ms` expose
+  command timing settings.
 
 Frames must start with `5A`, contain a valid checksum, and use recognized
 seven-segment codes. Digit decoding respects the decimal-point bit, so both
@@ -116,7 +195,52 @@ the rejected frame. Incomplete frames are discarded after a 30 ms receive gap.
 If the page cannot reach the monitor, it clears the displayed live height and
 shows `Monitor unreachable`.
 
-## Decoder tests
+## Web controls and command API
+
+Preset buttons simulate a 100 ms press, followed by release. The owner confirmed
+that the desk completes preset travel without holding the button and that any
+new button press interrupts preset travel, including the same preset again.
+There must be at least 100 ms of release before another ESP press can start.
+The press duration still needs checking on hardware.
+
+UP/DOWN buttons move while held. The page renews a command every 100 ms; the ESP
+expires it after 300 ms without renewal. A single hold is limited to ten seconds,
+then requires a new press. Releasing the button, hiding the page, or losing focus
+requests release. A physical panel press cancels the ESP command, and later web
+renewals for its old ID are rejected.
+
+Commands do not depend on the display being a fresh height. New commands require
+a checksum-valid idle panel frame within the last 250 ms. Missing panel traffic,
+malformed traffic, UART overflow, or an observed TX failure cancels ESP control.
+No ESP command resumes after reboot.
+
+All control endpoints use `POST` with form fields. Successful responses contain
+`command_id`; invalid arguments return HTTP 400 and conflicts return HTTP 409.
+The page never automatically retries a preset request.
+
+```sh
+# Press preset 1. Change number to 2 or 3 for the other presets.
+curl -d 'number=1' http://192.168.4.1/api/preset
+
+# Start an UP hold. The response gives its command_id.
+curl -d 'direction=up' http://192.168.4.1/api/move
+
+# Renew that hold before its lease expires, using the returned ID.
+curl -d 'direction=up&id=123' http://192.168.4.1/api/move
+
+# Release that command. Replace 123 with the returned ID.
+curl -d 'id=123' http://192.168.4.1/api/release
+```
+
+Use `direction=down` for DOWN. Renewals require the same direction and ID as the
+active hold. IDs also prevent a delayed release from cancelling a newer command.
+For manual API tests, a lone move request expires automatically after 300 ms.
+
+`/api/release` ends the simulated button press. It does not stop autonomous preset
+travel. Pressing a preset again can interrupt travel but can also start travel
+when stationary, so it is not labelled as an unconditional Stop button.
+
+## Host tests
 
 Run these from the project directory. The build above creates `.pio`:
 
@@ -125,25 +249,51 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
   -fsanitize=address,undefined -Iinclude \
   tests/desk_protocol_test.cpp -o .pio/desk_protocol_test
 .pio/desk_protocol_test
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Iinclude \
+  tests/panel_bridge_test.cpp -o .pio/panel_bridge_test
+.pio/panel_bridge_test
+node tests/web_controls_test.js
 ```
 
 Tests cover all seven captured examples, checksum rejection, invalid display
 codes, decimal placement, stale readings, recovery after corrupt/truncated frames,
 header-valued payload bytes, partial-frame timeouts, and timer wraparound.
+Bridge tests cover transparent forwarding, malformed-frame recovery, command
+timing, release gaps, physical-panel priority, stale renewal/release rejection,
+lease and absolute hold expiry, failure cancellation, and timer wraparound.
+Web tests cover preset submission, hold renewal/release, early pointer release,
+physical override, connection failure, and cached-height display. These tests do
+not verify electrical signaling or software-UART timing with Wi-Fi.
 
 ## First desk test
 
-Leave the desk stationary and keep the page open for at least 30 seconds. Report:
+Start with the desk stationary and keep the page open for at least 30 seconds.
+Check the original panel display and compare the web height with it. Then test a
+short physical UP/DOWN press and release, followed by the original preset buttons.
+Keep the page polling throughout, and report:
 
 - Whether the access point and page appear and remain available.
 - Whether the height matches the desk's known position.
+- Whether panel buttons, release, and presets behave as with the direct cable.
 - The JSON diagnostics, especially byte/frame counters and the last frame.
+- Whether panel received/forwarded counters match while web commands are inactive,
+  and both overflow counters and write failures remain zero.
 - Whether the desk behaves differently during power-up or reset.
 
 Increasing valid-frame counts with a stable height establish the first receive
-test. Zero received bytes alone cannot distinguish an absent heartbeat from a
-shared-RX electrical problem. Increasing bytes with few valid frames suggests a
-signal or framing problem. Live UART reliability, desk-powered supply stability,
-and keypad-free behavior still require this hardware test.
+test. Zero status bytes suggest checking the D5 tap, ground, signal levels, and
+controller traffic. Zero panel bytes suggest checking the panel-side D6 wire and
+panel power. Increasing bytes with few valid frames suggests a signal or framing
+problem. Live forwarding latency, UART reliability with Wi-Fi, and desk-powered
+supply stability still require hardware verification.
 
-Movement controls come after those results and a separate idle-packet test.
+## First remote-control test
+
+After flashing, check a brief web UP/DOWN hold and release, then a preset click.
+Check that pressing a preset again interrupts travel. During a web hold, press
+any physical panel button and confirm that its action passes through and web
+movement does not resume. Also release a web hold before its start request
+finishes, hide the page during a hold, and disconnect Wi-Fi during a hold.
+Report behavior and `/api/status`, especially `panel_uart_overruns`,
+`panel_write_failures`, `panel_invalid_frames`, and `physical_overrides`.

@@ -1,5 +1,24 @@
 # Standing desk Wi-Fi controller: ESP8266 implementation handoff
 
+## Current inline-panel implementation
+
+The owner has since chosen to keep the original panel connected through a
+removable ESP adapter, with direct reconnection as the failure fallback. The
+current firmware uses D5/GPIO14 for a tap on controller status, D6/GPIO12 for
+panel command input, and D7/GPIO13 for output to the controller. Only contact 1
+is split; controller status and panel power remain connected straight through.
+GPIO1/TX and GPIO3/RX are reserved for USB. See `README.md` for the current wiring,
+power options, flashing instructions, and passthrough test.
+
+The firmware forwards panel traffic, reports height, and adds web/API preset and
+hold-to-move controls. Physical panel presses cancel ESP control and pass through.
+The owner has verified height reporting, panel forwarding, and desk-powered use.
+The owner also confirmed that preset taps start autonomous travel and any new
+button press interrupts it. ESP control still needs a physical test. See
+`README.md` for the current API, timing, diagnostics, and test instructions.
+The replacement-panel proposal and stages below are the original handoff; their
+wiring and keypad-absence tests do not describe the current inline adapter.
+
 ## Objective
 
 Build a network-controlled replacement for the original standing desk keypad using an existing **Wemos D1 Mini (ESP8266)**. The original keypad plugs into an 8-contact modular connector (RJ45 form factor). It is acceptable to unplug the ESP8266 and reconnect the original keypad when changing saved presets.
