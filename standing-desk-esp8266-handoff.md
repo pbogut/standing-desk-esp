@@ -10,12 +10,15 @@ is split; controller status and panel power remain connected straight through.
 GPIO1/TX and GPIO3/RX are reserved for USB. See `README.md` for the current wiring,
 power options, flashing instructions, and passthrough test.
 
-The firmware forwards panel traffic, reports height, and adds web/API preset and
-hold-to-move controls. Physical panel presses cancel ESP control and pass through.
-The owner has verified height reporting, panel forwarding, and desk-powered use.
+The firmware forwards panel traffic, reports height, and adds web/API preset,
+hold-to-move, and automatic target-height controls. Physical panel presses cancel
+ESP control and pass through. The owner has verified height reporting, panel
+forwarding, desk-powered use, and the manual web/API controls.
 The owner also confirmed that preset taps start autonomous travel and any new
-button press interrupts it. ESP control still needs a physical test. See
-`README.md` for the current API, timing, diagnostics, and test instructions.
+button press interrupts it. Automatic target movement requires a fresh clean
+height display, cancels on invalid/stale readings or two seconds without progress,
+and has a 60-second travel limit. It still needs a physical test. See `README.md`
+for the current API, timing, diagnostics, and test instructions.
 The replacement-panel proposal and stages below are the original handoff; their
 wiring and keypad-absence tests do not describe the current inline adapter.
 

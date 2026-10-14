@@ -9,7 +9,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function element(dataset = {}) {
   return {
-    dataset, textContent: '', disabled: true, listeners: {},
+    dataset, textContent: '', value: '', disabled: true, listeners: {},
     addEventListener(name, callback) { this.listeners[name] = callback; },
     setPointerCapture() {},
     fire(name, properties = {}) {
@@ -21,7 +21,8 @@ function element(dataset = {}) {
 
 async function page() {
   const elements = Object.fromEntries(
-    ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state']
+    ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state',
+     'target-form', 'target-height', 'target-submit', 'target-cancel', 'target-state']
       .map(id => [id, element()]));
   elements['control-state'].textContent = 'Connecting controls...';
   const presets = [1, 2, 3].map(number => element({preset: String(number)}));
@@ -37,7 +38,8 @@ async function page() {
     offline: false,
     status: {fresh: false, height_cm: null, last_known_height_cm: null,
       state: 'waiting_for_frames', panel_fresh: true, remote_ready: true,
-      remote_button: 'idle', remote_command_id: 0}
+      remote_button: 'idle', remote_command_id: 0, target_ready: false,
+      target_active: false, target_command_id: 0, target_state: 'idle', target_reason: 'idle'}
   };
   const context = vm.createContext({
     document, window, AbortController, URLSearchParams,
@@ -53,7 +55,8 @@ async function page() {
       client.requests.push({url, args, options});
       if (client.responses.length) return client.responses.shift()(url, args);
       const id = args.id ? Number(args.id) : ++commandId;
-      return {ok: true, json: async () => ({command_id: id})};
+      return {ok: true, json: async () => ({command_id: id,
+        target_command_id: id, target_active: url === '/api/target'})};
     }
   });
   client.run = code => vm.runInContext(code, context);
@@ -199,6 +202,76 @@ async function page() {
     await flush();
     assert.equal(client.requests[1].url, '/api/release', event);
     assert(![...client.timers.values()].some(timer => timer.delay === 100), event);
+  }
+
+  // Cached heights never enable automatic controls. Fresh eligibility comes
+  // from the firmware, and target commands are single POSTs without renewals.
+  {
+    const client = await page();
+    client.elements['target-height'].value = '95';
+    client.status.last_known_height_cm = 80;
+    await client.poll();
+    assert(client.elements['target-submit'].disabled);
+    await client.elements['target-form'].fire('submit');
+    assert.equal(client.requests.length, 0);
+    client.status.target_ready = true;
+    await client.poll();
+    assert(!client.elements['target-submit'].disabled);
+    await client.elements['target-form'].fire('submit');
+    assert.equal(client.requests.length, 1);
+    assert.equal(client.requests[0].url, '/api/target');
+    assert.deepEqual(client.requests[0].args, {height_cm: '95'});
+    assert(![...client.timers.values()].some(timer => timer.delay === 100));
+    assert(client.presets.every(button => button.disabled));
+    assert(client.moves.every(button => button.disabled));
+    assert(!client.elements['target-cancel'].disabled);
+    client.window.fire('pagehide');
+    client.window.fire('blur');
+    assert.equal(client.requests.length, 1, 'automatic movement is owned by the ESP');
+    client.elements['target-cancel'].fire('click');
+    await flush();
+    assert.equal(client.requests[1].url, '/api/target/cancel');
+    assert.deepEqual(client.requests[1].args, {id: '1'});
+  }
+
+  // An early cancel waits for the accepted target ID, then cancels that ID.
+  {
+    const client = await page();
+    client.status.target_ready = true;
+    await client.poll();
+    client.elements['target-height'].value = '90';
+    let respond;
+    client.responses.push(() => new Promise(resolve => { respond = resolve; }));
+    const pending = client.elements['target-form'].fire('submit');
+    client.elements['target-cancel'].fire('click');
+    respond({ok: true, json: async () => ({target_active: true, target_command_id: 42})});
+    await pending;
+    assert.equal(client.requests.length, 2);
+    assert.equal(client.requests[1].url, '/api/target/cancel');
+    assert.deepEqual(client.requests[1].args, {id: '42'});
+  }
+
+  // Refused starts are not retried, and completion/cancellation reasons are shown.
+  {
+    const client = await page();
+    client.status.target_ready = true;
+    await client.poll();
+    client.elements['target-height'].value = '90';
+    client.responses.push(async () => ({ok: false,
+      json: async () => ({error: 'A fresh clean height display is required'})}));
+    await client.elements['target-form'].fire('submit');
+    assert.equal(client.requests.length, 1);
+    assert.match(client.elements['control-state'].textContent, /fresh clean height/);
+    Object.assign(client.status, {target_active: true, target_command_id: 5,
+      target_height_cm: 90, target_direction: 'up', target_state: 'moving',
+      target_reason: 'moving', target_ready: false, remote_ready: false});
+    await client.poll();
+    assert.equal(client.elements['target-state'].textContent, 'Moving up to 90 cm');
+    Object.assign(client.status, {target_active: false, target_state: 'cancelled',
+      target_reason: 'panel_override'});
+    await client.poll();
+    assert.equal(client.elements['target-state'].textContent, 'cancelled. panel override');
+    assert(client.elements['target-cancel'].disabled);
   }
   console.log('All web controls tests passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

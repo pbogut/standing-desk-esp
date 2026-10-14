@@ -5,8 +5,9 @@ panel. It forwards panel commands at 9600 baud, 8N1, reads height/status on a
 separate input, and serves a diagnostics page over its password-protected Wi-Fi
 access point. D5/D6/D7 handle desk traffic; RX/TX remain available for USB.
 
-The web page controls presets 1/2/3 and hold-to-move UP/DOWN. Any physical panel
-button takes priority and cancels the active ESP button press.
+The web page controls presets 1/2/3, hold-to-move UP/DOWN, and automatic movement
+to a whole-centimetre target between 68 and 120 cm. Any physical panel button
+takes priority and cancels the active ESP button press.
 
 ## Wiring
 
@@ -184,6 +185,18 @@ curl http://192.168.4.1/api/status
   and a completed release gap.
 - `hold_lease_ms`, `max_hold_ms`, `preset_press_ms`, and `release_gap_ms` expose
   command timing settings.
+- `automatic_height_valid` requires a clean height layout within 68..120 cm,
+  received less than 250 ms ago. Cached height does not qualify.
+- `target_active` indicates an automatic move. `target_ready` indicates that a
+  new target can be accepted, including the display and panel-idle checks.
+- `target_height_cm` retains the last requested target, or is `null` before the
+  first accepted request. `target_command_id` identifies that request's ESP press.
+- `target_direction` is `up`, `down`, or `idle`. `target_state` is `idle`, `moving`,
+  `complete`, or `cancelled`. `target_reason` records completion or cancellation,
+  for example `reached`, `invalid_display`, `height_stale`, `no_progress`,
+  `wrong_direction`, `panel_override`, `cancelled`, or `travel_timeout`.
+- `target_progress_timeout_ms`, `target_max_travel_ms`, and
+  `automatic_height_timeout_ms` expose automatic-movement timing settings.
 
 Frames must start with `5A`, contain a valid checksum, and use recognized
 seven-segment codes. Digit decoding respects the decimal-point bit, so both
@@ -209,10 +222,10 @@ then requires a new press. Releasing the button, hiding the page, or losing focu
 requests release. A physical panel press cancels the ESP command, and later web
 renewals for its old ID are rejected.
 
-Commands do not depend on the display being a fresh height. New commands require
-a checksum-valid idle panel frame within the last 250 ms. Missing panel traffic,
-malformed traffic, UART overflow, or an observed TX failure cancels ESP control.
-No ESP command resumes after reboot.
+Manual UP/DOWN and preset commands do not depend on the display being a fresh
+height. New commands require a checksum-valid idle panel frame within the last
+250 ms. Missing panel traffic, malformed traffic, UART overflow, or an observed
+TX failure cancels ESP control. No ESP command resumes after reboot.
 
 All control endpoints use `POST` with form fields. Successful responses contain
 `command_id`; invalid arguments return HTTP 400 and conflicts return HTTP 409.
@@ -240,6 +253,53 @@ For manual API tests, a lone move request expires automatically after 300 ms.
 travel. Pressing a preset again can interrupt travel but can also start travel
 when stationary, so it is not labelled as an unconditional Stop button.
 
+## Automatic target height
+
+Enter a whole-centimetre height from 68 through 120 and choose **Move to height**.
+The ESP chooses UP or DOWN and releases when the displayed height reaches or
+crosses the target. It does not reverse to correct overshoot. If already at the
+requested height, it completes without sending a button press.
+
+Only checksum-valid, recognized height displays qualify:
+
+- 68.0 through 99.9 with a decimal point on the second digit.
+- 100 through 120 with no decimal point.
+- The most recent qualifying reading must be less than 250 ms old.
+
+The generic display decoder and cached-height UI still accept other numeric
+layouts, but those are not used to steer automatic movement. A non-height
+display, corrupt checksum, truncated status frame, or status UART overflow
+cancels the move. If a different display mode produces exactly the same valid
+height bytes, the current protocol cannot distinguish it.
+
+The ESP cancels if height is stale for 250 ms, moves in the wrong direction, or
+does not progress for two seconds. The progress timeout includes motor startup
+and allows repeated equal readings between actual display changes. A target
+move can run past the manual ten-second hold limit but has a separate 60-second
+travel limit and retains the bridge's 300 ms local renewal lease.
+
+Physical panel presses cancel the target and pass through. Cancellation is
+latched: a subsequent valid display does not resume the move. **Cancel automatic
+move** releases its UP/DOWN press; the existing **Release** action also ends it.
+Manual controls and new targets cannot replace an active target move. Closing
+the browser or losing Wi-Fi does not cancel a target; the ESP manages it locally
+using the display, progress checks, and timeouts. Reboot never resumes a target.
+
+```sh
+# Start automatic movement to 95 cm. The response includes target_command_id.
+curl -d 'height_cm=95' http://192.168.4.1/api/target
+
+# Cancel that target. Replace 123 with its target_command_id.
+curl -d 'id=123' http://192.168.4.1/api/target/cancel
+```
+
+`height_cm` accepts whole centimetres, including an optional `.0` suffix.
+Fractional targets, malformed values, and values outside 68..120 return HTTP 400.
+A stale/unsupported display, active command, or panel conflict returns HTTP 409.
+An accepted request returns HTTP 200 with the current target state and reason.
+The cancel endpoint requires that target's ID so a delayed old cancel cannot
+stop a newer move. Requests are never automatically retried by the page.
+
 ## Host tests
 
 Run these from the project directory. The build above creates `.pio`:
@@ -253,7 +313,12 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
   -fsanitize=address,undefined -Iinclude \
   tests/panel_bridge_test.cpp -o .pio/panel_bridge_test
 .pio/panel_bridge_test
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Iinclude \
+  tests/target_move_test.cpp -o .pio/target_move_test
+.pio/target_move_test
 node tests/web_controls_test.js
+python3 tests/command_api_test.py
 ```
 
 Tests cover all seven captured examples, checksum rejection, invalid display
@@ -262,9 +327,14 @@ header-valued payload bytes, partial-frame timeouts, and timer wraparound.
 Bridge tests cover transparent forwarding, malformed-frame recovery, command
 timing, release gaps, physical-panel priority, stale renewal/release rejection,
 lease and absolute hold expiry, failure cancellation, and timer wraparound.
-Web tests cover preset submission, hold renewal/release, early pointer release,
-physical override, connection failure, and cached-height display. These tests do
-not verify electrical signaling or software-UART timing with Wi-Fi.
+Target tests cover strict height layouts, direction, target crossing, stale or
+corrupt display cancellation, stalled motion, travel limits, physical override,
+scoped cancellation, failure handling, and timer wraparound. Web tests cover
+manual controls, cached height, target eligibility/submission, and early cancel.
+API tests compile the firmware's actual command handlers and serial servicing
+with host doubles to check arguments, JSON, status codes, and cancellation before
+the next outgoing movement packet. These tests do not verify electrical signaling
+or software-UART timing with Wi-Fi.
 
 ## First desk test
 
@@ -297,3 +367,14 @@ movement does not resume. Also release a web hold before its start request
 finishes, hide the page during a hold, and disconnect Wi-Fi during a hold.
 Report behavior and `/api/status`, especially `panel_uart_overruns`,
 `panel_write_failures`, `panel_invalid_frames`, and `physical_overrides`.
+
+## First target-height test
+
+Start with a nearby whole-centimetre target in each direction. Check the displayed
+height where movement stops and report any overshoot. Try a target equal to the
+current height and confirm it sends no movement command. With the time display
+selected, a target request should be refused. During a target move, change the
+display or press any physical button and confirm cancellation without resuming.
+Also check the web cancel button and the two-second stall timeout at a travel
+limit. Report `/api/status`, especially `automatic_height_valid`, `target_state`,
+`target_reason`, the target/actual height, and UART error counters.

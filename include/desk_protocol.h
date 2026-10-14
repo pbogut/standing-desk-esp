@@ -6,6 +6,7 @@
 class DeskMonitor {
  public:
   static constexpr uint32_t staleMs = 1000;
+  static constexpr uint32_t automaticStaleMs = 250;
   static constexpr uint32_t frameGapMs = 30;
   uint32_t bytes = 0, validFrames = 0, checksumFailures = 0;
   uint32_t invalidDisplays = 0, partialTimeouts = 0;
@@ -20,7 +21,7 @@ class DeskMonitor {
   }
 
   bool automaticHeightFresh(uint32_t now) const {
-    return displayHeight && hasHeight && uint32_t(now - lastHeightMs) < 250;
+    return displayHeight && hasHeight && uint32_t(now - lastHeightMs) < automaticStaleMs;
   }
 
   void inputOverflow() { displayHeight = false; }

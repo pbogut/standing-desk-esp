@@ -6,12 +6,14 @@
 #include "desk_protocol.h"
 #include "panel_bridge.h"
 #include "secrets.h"
+#include "target_move.h"
 
 static_assert(sizeof(apPassword) >= 9 && sizeof(apPassword) <= 64,
               "AP password must contain 8 to 63 characters");
 
 DeskMonitor desk;
 PanelBridge panel;
+TargetMove target;
 SoftwareSerial statusSerial;
 SoftwareSerial panelSerial;
 ESP8266WebServer server(80);
@@ -48,6 +50,13 @@ button[data-direction]{touch-action:none;user-select:none}
 <p>Release ends an ESP button press, not automatic preset travel.
 Press a preset again or any physical button to interrupt preset travel.</p>
 <p id="control-state" role="status">Connecting controls...</p>
+<form id="target-form">
+<label for="target-height">Target height, cm</label>
+<input id="target-height" type="number" min="68" max="120" step="1" required disabled>
+<button id="target-submit" type="submit" disabled>Move to height</button>
+<button id="target-cancel" type="button" disabled>Cancel automatic move</button>
+</form>
+<p id="target-state" role="status">Automatic movement requires a fresh height display.</p>
 <details open><summary>UART diagnostics</summary><pre id="diagnostics"></pre></details>
 <script>
 const height=document.getElementById('height');
@@ -56,14 +65,23 @@ const diagnostics=document.getElementById('diagnostics');
 const panel=document.getElementById('panel');
 const controlState=document.getElementById('control-state');
 const releaseButton=document.getElementById('release');
+const targetForm=document.getElementById('target-form');
+const targetHeight=document.getElementById('target-height');
+const targetSubmit=document.getElementById('target-submit');
+const targetCancel=document.getElementById('target-cancel');
+const targetState=document.getElementById('target-state');
 const presetButtons=[...document.querySelectorAll('[data-preset]')];
 const moveButtons=[...document.querySelectorAll('[data-direction]')];
 let available=false, presetPending=false, hold=null, remoteId=null;
+let targetReady=false, targetActive=false, targetId=null, targetRequest=null;
 function updateControls(){
-  for(const button of presetButtons)button.disabled=!available || presetPending || hold!==null;
+  const busy=presetPending || targetActive || targetRequest!==null;
+  for(const button of presetButtons)button.disabled=!available || busy || hold!==null;
   for(const button of moveButtons)button.disabled=hold!==null
-    ? button.dataset.direction!==hold.direction : !available || presetPending;
+    ? button.dataset.direction!==hold.direction : !available || busy;
   releaseButton.disabled=hold===null && remoteId===null;
+  targetHeight.disabled=targetSubmit.disabled=!targetReady || busy || hold!==null;
+  targetCancel.disabled=targetRequest===null && !targetActive;
 }
 async function command(path, args){
   const abort=new AbortController();
@@ -99,7 +117,7 @@ async function renewHold(current){
   }catch(error){if(hold===current)endHold('Hold ended: '+error.message);}
 }
 async function beginHold(direction){
-  if(hold!==null || presetPending || !available)return;
+  if(hold!==null || presetPending || targetActive || targetRequest!==null || !available)return;
   const current={direction,id:null,pressed:true,timer:null};
   hold=current;
   available=false;
@@ -114,7 +132,7 @@ async function beginHold(direction){
   }catch(error){if(hold===current)endHold('Could not start: '+error.message);}
 }
 for(const button of presetButtons)button.addEventListener('click',async()=>{
-  if(!available || presetPending || hold!==null)return;
+  if(!available || presetPending || hold!==null || targetActive || targetRequest!==null)return;
   presetPending=true;
   available=false;
   updateControls();
@@ -123,6 +141,39 @@ for(const button of presetButtons)button.addEventListener('click',async()=>{
     controlState.textContent='Preset '+button.dataset.preset+' pressed';
   }catch(error){controlState.textContent='Preset request failed: '+error.message;}
   finally{presetPending=false;updateControls();}
+});
+async function cancelAutomatic(id){
+  try{
+    await command('target/cancel',{id});
+    targetActive=false;
+    available=targetReady=false;
+    targetState.textContent='Automatic move cancelled';
+  }catch(error){controlState.textContent='Cancel request failed: '+error.message;}
+  updateControls();
+}
+targetForm.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(!targetReady || targetActive || targetRequest!==null || presetPending || hold!==null)return;
+  const current={cancelled:false};
+  targetRequest=current;
+  available=targetReady=false;
+  const requestedHeight=targetHeight.value;
+  targetState.textContent='Requesting '+requestedHeight+' cm...';
+  updateControls();
+  try{
+    const data=await command('target',{height_cm:requestedHeight});
+    targetId=data.target_command_id;
+    targetActive=data.target_active;
+    if(current.cancelled && targetActive)await cancelAutomatic(targetId);
+    else targetState.textContent=targetActive ? 'Moving to '+requestedHeight+' cm' : 'Target already reached';
+  }catch(error){controlState.textContent='Target request failed: '+error.message;}
+  finally{targetRequest=null;updateControls();}
+});
+targetCancel.addEventListener('click',()=>{
+  if(targetRequest!==null){
+    targetRequest.cancelled=true;
+    targetState.textContent='Cancelling automatic move...';
+  }else if(targetActive && targetId!==null)cancelAutomatic(targetId);
 });
 for(const button of moveButtons){
   button.addEventListener('pointerdown',event=>{
@@ -164,6 +215,13 @@ async function poll(){
     panel.textContent=data.panel_fresh ? 'Panel traffic received' : 'No recent panel traffic';
     diagnostics.textContent=JSON.stringify(data,null,2);
     available=data.remote_ready;
+    targetReady=data.target_ready;
+    targetActive=data.target_active;
+    targetId=data.target_command_id;
+    targetState.textContent=targetActive
+      ? 'Moving '+data.target_direction+' to '+data.target_height_cm+' cm'
+      : data.target_state==='idle' ? 'Automatic movement requires a fresh height display.'
+      : data.target_state+'. '+data.target_reason.replaceAll('_',' ');
     if(controlState.textContent==='Connecting controls...'
        || controlState.textContent==='Waiting for idle panel')
       controlState.textContent=available ? 'Controls ready' : 'Waiting for idle panel';
@@ -176,6 +234,8 @@ async function poll(){
     state.textContent='Monitor unreachable';
     panel.textContent='Panel status unavailable';
     available=false;
+    targetReady=false;
+    targetState.textContent='Monitor unreachable. Automatic movement is managed by the ESP.';
     remoteId=null;
     endHold('Monitor unreachable');
     controlState.textContent='Monitor unreachable';
@@ -193,18 +253,33 @@ void serviceSerial() {
     ++panelUartOverruns;
     panel.inputOverflow(millis());
   }
-  // Commands get priority; status still arrives through the direct panel wire.
-  panel.forward(panelSerial, millis());
-  // Bound each pass so continuous noise cannot starve the network/watchdog.
+  if (statusSerial.overflow()) {
+    ++uartOverruns;
+    desk.inputOverflow();
+    target.stop("status_uart_overflow", panel, millis());
+  }
+  // Check every display frame before transmitting another automatic command.
+  // A bad display followed by a valid one in the same batch must still cancel.
   for (unsigned count = 0; count < 256 && statusSerial.available(); ++count) {
     const int byte = statusSerial.read();
-    if (byte >= 0) desk.feed(static_cast<uint8_t>(byte), millis());
+    if (byte >= 0) {
+      desk.feed(static_cast<uint8_t>(byte), millis());
+      target.update(desk, panel, millis());
+    }
   }
-  if (statusSerial.overflow()) ++uartOverruns;
+  if (statusSerial.available()) target.stop("status_backlog", panel, millis());
+  if (statusSerial.overflow()) {
+    ++uartOverruns;
+    desk.inputOverflow();
+    target.stop("status_uart_overflow", panel, millis());
+  }
+  target.update(desk, panel, millis());
+  panel.forward(panelSerial, millis());
   if (panelSerial.overflow()) {
     ++panelUartOverruns;
     panel.inputOverflow(millis());
   }
+  target.update(desk, panel, millis());
 }
 
 const char *remoteButtonName() {
@@ -218,9 +293,28 @@ const char *remoteButtonName() {
   }
 }
 
+void appendTargetStatus(String &json, uint32_t now) {
+  json += F(",\"automatic_height_valid\":");
+  json += desk.automaticHeightFresh(now) ? "true" : "false";
+  json += F(",\"target_active\":"); json += target.active() ? "true" : "false";
+  json += F(",\"target_ready\":");
+  json += !target.active() && desk.automaticHeightFresh(now) && panel.ready(now) ? "true" : "false";
+  json += F(",\"target_command_id\":"); json += target.commandId;
+  json += F(",\"target_height_cm\":");
+  json += target.state == TargetMove::State::Idle ? String("null") : String(target.targetHundredths / 100);
+  json += F(",\"target_direction\":\"");
+  json += !target.active() ? "idle" : target.button == 0x20 ? "up" : "down";
+  json += F("\",\"target_state\":\""); json += target.stateName();
+  json += F("\",\"target_reason\":\""); json += target.reason; json += '"';
+  json += F(",\"target_progress_timeout_ms\":"); json += TargetMove::progressTimeoutMs;
+  json += F(",\"target_max_travel_ms\":"); json += PanelBridge::maxTargetMs;
+  json += F(",\"automatic_height_timeout_ms\":"); json += DeskMonitor::automaticStaleMs;
+}
+
 void commandResult(int code, const char *error = nullptr) {
   String json = F("{\"command_id\":");
   json += panel.commandId;
+  appendTargetStatus(json, millis());
   if (error) {
     json += F(",\"error\":\"");
     json += error;
@@ -290,7 +384,43 @@ void releaseDesk() {
     return;
   }
   const bool accepted = panel.release(id, millis());
+  target.update(desk, panel, millis());
   commandResult(accepted ? 200 : 409, accepted ? nullptr : "Command id is no longer current");
+}
+
+bool readTargetHeight(uint16_t &height) {
+  const String text = server.arg("height_cm");
+  unsigned length = text.length();
+  if (length >= 3 && text[length - 2] == '.' && text[length - 1] == '0') length -= 2;
+  if (length == 0 || length > 3) return false;
+  height = 0;
+  for (unsigned i = 0; i < length; ++i) {
+    if (text[i] < '0' || text[i] > '9') return false;
+    height = height * 10 + text[i] - '0';
+  }
+  return height >= 68 && height <= 120;
+}
+
+void setTarget() {
+  serviceSerial();
+  uint16_t height;
+  if (!readTargetHeight(height)) {
+    commandResult(400, "height_cm must be a whole centimetre between 68 and 120");
+    return;
+  }
+  const char *error = target.start(height, desk, panel, millis());
+  commandResult(error ? 409 : 200, error);
+}
+
+void cancelTarget() {
+  serviceSerial();
+  uint32_t id;
+  if (!readCommandId(id)) {
+    commandResult(400, "id must be a nonzero 32-bit unsigned integer");
+    return;
+  }
+  const bool accepted = target.cancel(id, panel, millis());
+  commandResult(accepted ? 200 : 409, accepted ? nullptr : "Automatic command id is no longer current");
 }
 
 String heightString() {
@@ -304,7 +434,7 @@ void sendStatus() {
   const char *state = fresh ? "fresh" : desk.validFrames == 0 ? "waiting_for_frames"
       : !desk.displayNumeric ? "unsupported_display" : "stale";
   String json;
-  json.reserve(1280);
+  json.reserve(1792);
   json = F("{\"state\":\"");
   json += state;
   json += F("\",\"fresh\":");
@@ -348,6 +478,7 @@ void sendStatus() {
   json += F(",\"remote_button\":\""); json += remoteButtonName(); json += '"';
   json += F(",\"remote_command_id\":"); json += panel.commandId;
   json += F(",\"remote_ready\":"); json += panel.ready(now) ? "true" : "false";
+  appendTargetStatus(json, now);
   json += F(",\"hold_lease_ms\":"); json += PanelBridge::holdLeaseMs;
   json += F(",\"max_hold_ms\":"); json += PanelBridge::maxHoldMs;
   json += F(",\"preset_press_ms\":"); json += PanelBridge::presetMs;
@@ -382,6 +513,8 @@ void setup() {
   server.on("/api/preset", HTTP_POST, pressPreset);
   server.on("/api/move", HTTP_POST, moveDesk);
   server.on("/api/release", HTTP_POST, releaseDesk);
+  server.on("/api/target", HTTP_POST, setTarget);
+  server.on("/api/target/cancel", HTTP_POST, cancelTarget);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
