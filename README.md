@@ -2,8 +2,9 @@
 
 Firmware for a Wemos D1 Mini placed between the desk controller and original
 panel. It forwards panel commands at 9600 baud, 8N1, reads height/status on a
-separate input, and serves a diagnostics page over its password-protected Wi-Fi
-access point. D5/D6/D7 handle desk traffic; RX/TX remain available for USB.
+separate input, and serves controls and diagnostics on your home Wi-Fi, with a
+password-protected setup/backup access point. D5/D6/D7 handle desk traffic;
+RX/TX remain available for USB.
 
 The web page controls presets 1/2/3, hold-to-move UP/DOWN, and automatic movement
 to a whole-centimetre target between 68 and 120 cm. Any physical panel button
@@ -110,10 +111,12 @@ Create them with the steps above on the laptop too.
 4. For the first test, keep USB power, leave the ESP's 5V desk tap disconnected,
    and connect the adapter between the desk and original panel. If later using
    desk power, disconnect USB before connecting the desk's 5 V tap.
-5. Join the Wi-Fi network named `standing-desk-<chip-id>`. Its password is the
-   `apPassword` value in `include/secrets.h`. Accept staying connected to this
-   network without internet access if your phone asks.
-6. Open **http://192.168.4.1/**.
+5. On first boot with no saved home Wi-Fi, join `standing-desk-<chip-id>`.
+   Its password is the `apPassword` value in `include/secrets.h`. Accept staying
+   connected without internet access if your phone asks.
+6. Open **http://192.168.4.1/** and expand **Wi-Fi settings** to configure your home
+   network. If settings were previously saved, the ESP first tries that network;
+   use its home-network IP or hostname, or wait 60 seconds for the backup AP.
 
 USB serial is now independent of desk traffic. The optional serial monitor runs
 at 115200 baud and prints a startup message:
@@ -139,6 +142,58 @@ replacement D1 Mini. The bridge firmware builds and its host tests pass; upload
 and physical forwarding still need verification on the replacement.
 
 `platformio.ini` currently sets the upload speed to 57600 baud.
+
+## Home Wi-Fi setup and backup network
+
+1. On the setup access point, open **http://192.168.4.1/**.
+2. Expand **Wi-Fi settings**, enter your **2.4 GHz** network's SSID and password,
+   and choose **Save and connect**.
+3. The page shows the connection status and home-network IP. Switch your phone or
+   laptop to your home Wi-Fi and open that IP address.
+
+The access point remains available while a settings change connects, so an
+incorrect password does not remove your setup connection. Once home Wi-Fi has
+stayed connected for 30 seconds, the backup AP shuts down. You can also use
+`http://standing-desk-<chip-id>.local/` on networks/devices that support mDNS,
+or find the desk by that hostname in your router's client list.
+
+SSID/password are saved in the board's LittleFS flash storage and survive power
+loss and ordinary firmware uploads. A filesystem upload or full flash erase can
+clear them. The stored record is versioned and checksummed; failed updates retain
+the old record. Passwords are never returned in API/status responses or logs.
+Saving replaces both settings; an empty password explicitly selects an open
+network, rather than reusing a previously saved password.
+
+Connection behavior:
+
+| Situation | Behavior |
+|---|---|
+| No valid saved settings | Start the setup AP immediately |
+| Saved settings on boot | Try home Wi-Fi without an AP initially |
+| Disconnected for 60 seconds | Start the backup AP and keep retrying home Wi-Fi |
+| Home Wi-Fi drops after connecting | Start a new 60-second fallback window |
+| Stable home connection with backup AP active | Close the AP after 30 seconds |
+| Forget network | Clear stored settings and start/keep the setup AP |
+
+Reconnect attempts run every 30 seconds, alongside the ESP's automatic
+reconnection. The backup network retains its existing name, password, and
+`192.168.4.1` address. Connection timing is non-blocking; the panel bridge and
+movement controller continue running while Wi-Fi is connecting or unavailable.
+Network changes are deferred for 500 ms after the settings reply so it can leave
+before the network interface changes.
+
+The API uses the current interface's IP address:
+
+- `GET /api/wifi`: saved SSID, connection state, home IP/hostname, backup AP status,
+  fallback countdown, and storage availability. It does not include the password.
+- `POST /api/wifi`: form fields `ssid` and `password`, saved before connecting.
+- `POST /api/wifi/forget`: remove saved settings and return to the setup AP.
+- `GET /api/status`: includes the same information in its `wifi` object.
+
+The SSID must be 1..32 bytes. Passwords must be 8..63 bytes, or empty for an open
+network. Invalid fields return HTTP 400; storage failures return HTTP 500 and
+leave the previous settings in use. **Forget network** is also available on the
+web page. After using it from home Wi-Fi, reconnect to the setup AP.
 
 ## Diagnostics
 
@@ -319,6 +374,11 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
 .pio/target_move_test
 node tests/web_controls_test.js
 python3 tests/command_api_test.py
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Iinclude \
+  tests/wifi_settings_test.cpp -o .pio/wifi_settings_test
+.pio/wifi_settings_test
+python3 tests/wifi_api_test.py
 ```
 
 Tests cover all seven captured examples, checksum rejection, invalid display
@@ -334,7 +394,10 @@ manual controls, cached height, target eligibility/submission, and early cancel.
 API tests compile the firmware's actual command handlers and serial servicing
 with host doubles to check arguments, JSON, status codes, and cancellation before
 the next outgoing movement packet. These tests do not verify electrical signaling
-or software-UART timing with Wi-Fi.
+or software-UART timing with Wi-Fi. Wi-Fi tests cover persisted-record recovery,
+failed writes/renames/removal, malformed records, fallback/retry/grace periods,
+timer wraparound, credential validation, password omission, escaped SSIDs,
+deferred network changes, and settings-page interactions.
 
 ## First desk test
 
@@ -378,3 +441,13 @@ display or press any physical button and confirm cancellation without resuming.
 Also check the web cancel button and the two-second stall timeout at a travel
 limit. Report `/api/status`, especially `automatic_height_valid`, `target_state`,
 `target_reason`, the target/actual height, and UART error counters.
+
+## First home Wi-Fi test
+
+Save your home SSID/password through the setup AP, confirm the home IP appears,
+and open the page from your home network. Power-cycle the desk and confirm it
+reconnects using the saved settings. Check that the physical panel still works
+during connection attempts. To check fallback, make the home network unavailable
+for at least 60 seconds and confirm the backup AP appears, then restore home Wi-Fi
+and confirm reconnection and eventual AP shutdown. `/api/wifi` reports the state
+and remaining fallback time.

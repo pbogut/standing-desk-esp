@@ -19,6 +19,11 @@ button press interrupts it. Automatic target movement requires a fresh clean
 height display, cancels on invalid/stale readings or two seconds without progress,
 and has a 60-second travel limit. It still needs a physical test. See `README.md`
 for the current API, timing, diagnostics, and test instructions.
+Wi-Fi credentials can now be entered on the web page and persist in LittleFS.
+With saved settings, the ESP tries home Wi-Fi and starts its backup AP after
+60 seconds offline. The AP stays available during setup and closes after a
+30-second stable home connection. Wi-Fi setup and fallback still need a physical
+test. Connection attempts are non-blocking so the panel bridge remains serviced.
 The replacement-panel proposal and stages below are the original handoff; their
 wiring and keypad-absence tests do not describe the current inline adapter.
 
