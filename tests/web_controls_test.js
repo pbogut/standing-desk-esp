@@ -23,6 +23,8 @@ async function page() {
   const elements = Object.fromEntries(
     ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state',
      'target-form', 'target-height', 'target-submit', 'target-cancel', 'target-state']
+      .concat(['wifi-form', 'wifi-ssid', 'wifi-password', 'wifi-save', 'wifi-forget',
+               'wifi-state', 'wifi-address', 'wifi-message'])
       .map(id => [id, element()]));
   elements['control-state'].textContent = 'Connecting controls...';
   const presets = [1, 2, 3].map(number => element({preset: String(number)}));
@@ -39,7 +41,9 @@ async function page() {
     status: {fresh: false, height_cm: null, last_known_height_cm: null,
       state: 'waiting_for_frames', panel_fresh: true, remote_ready: true,
       remote_button: 'idle', remote_command_id: 0, target_ready: false,
-      target_active: false, target_command_id: 0, target_state: 'idle', target_reason: 'idle'}
+      target_active: false, target_command_id: 0, target_state: 'idle', target_reason: 'idle',
+      wifi: {storage_ready: true, configured: false, ssid: '', connected: false,
+        state: 'setup_ap', ap_active: true, ap_ssid: 'standing-desk-test', ap_ip: '192.168.4.1'}}
   };
   const context = vm.createContext({
     document, window, AbortController, URLSearchParams,
@@ -54,6 +58,9 @@ async function page() {
       const args = Object.fromEntries(options.body);
       client.requests.push({url, args, options});
       if (client.responses.length) return client.responses.shift()(url, args);
+      if(url === '/api/wifi' || url === '/api/wifi/forget')return {ok: true,
+        json: async () => ({...client.status.wifi, configured: url === '/api/wifi',
+          ssid: args.ssid || '', state: 'applying'})};
       const id = args.id ? Number(args.id) : ++commandId;
       return {ok: true, json: async () => ({command_id: id,
         target_command_id: id, target_active: url === '/api/target'})};
@@ -272,6 +279,50 @@ async function page() {
     await client.poll();
     assert.equal(client.elements['target-state'].textContent, 'cancelled. panel override');
     assert(client.elements['target-cancel'].disabled);
+  }
+  // Wi-Fi setup saves form values, clears the entered password after success,
+  // and never overwrites edits with a polling response.
+  {
+    const client = await page();
+    assert(!client.elements['wifi-save'].disabled);
+    client.elements['wifi-ssid'].value='My home';
+    client.elements['wifi-ssid'].fire('input');
+    client.elements['wifi-password'].value='test-password';
+    await client.poll();
+    assert.equal(client.elements['wifi-ssid'].value,'My home');
+    await client.elements['wifi-form'].fire('submit');
+    assert.equal(client.requests[0].url,'/api/wifi');
+    assert.deepEqual(client.requests[0].args,{ssid:'My home',password:'test-password'});
+    assert.equal(client.elements['wifi-password'].value,'');
+    assert(!client.elements['wifi-forget'].disabled);
+    await client.elements['wifi-forget'].fire('click');
+    assert.equal(client.requests[1].url,'/api/wifi/forget');
+    assert.equal(client.elements['wifi-ssid'].value,'');
+    assert.match(client.elements['wifi-message'].textContent,/192\.168\.4\.1/);
+  }
+  // Invalid settings/storage errors keep input for correction and do not retry.
+  {
+    const client=await page();
+    client.elements['wifi-ssid'].value='Home';
+    client.elements['wifi-password'].value='short';
+    client.responses.push(async()=>({ok:false,json:async()=>({error:'Invalid password'})}));
+    await client.elements['wifi-form'].fire('submit');
+    assert.equal(client.requests.length,1);
+    assert.equal(client.elements['wifi-password'].value,'short');
+    assert.match(client.elements['wifi-message'].textContent,/Invalid password/);
+  }
+  {
+    const client=await page();
+    Object.assign(client.status.wifi,{configured:true,ssid:'Home',station_ssid:'Home',
+      state:'connected',connected:true,ip:'192.168.1.50'});
+    await client.poll();
+    assert.equal(client.elements['wifi-address'].href,'http://192.168.1.50/');
+    assert.equal(client.elements['wifi-address'].hidden,false);
+    assert.equal(client.elements['wifi-password'].value,'');
+    Object.assign(client.status.wifi,{state:'fallback_ap',connected:false});
+    await client.poll();
+    assert.match(client.elements['wifi-state'].textContent,/Still trying/);
+    assert.equal(client.elements['wifi-address'].hidden,true);
   }
   console.log('All web controls tests passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

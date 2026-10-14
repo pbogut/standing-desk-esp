@@ -1,12 +1,15 @@
 #include <Arduino.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <LittleFS.h>
 #include <SoftwareSerial.h>
 
 #include "desk_protocol.h"
 #include "panel_bridge.h"
 #include "secrets.h"
 #include "target_move.h"
+#include "wifi_credential_store.h"
 
 static_assert(sizeof(apPassword) >= 9 && sizeof(apPassword) <= 64,
               "AP password must contain 8 to 63 characters");
@@ -18,6 +21,16 @@ SoftwareSerial statusSerial;
 SoftwareSerial panelSerial;
 ESP8266WebServer server(80);
 uint32_t uartOverruns = 0, panelUartOverruns = 0;
+WifiCredentials wifiCredentials;
+WifiCredentialStore wifiStore;
+WifiConnection wifiConnection;
+String deviceName;
+bool wifiStorageReady = false, mdnsRunning = false;
+enum class WifiChange { None, Connect, Forget };
+WifiChange wifiChange = WifiChange::None;
+uint32_t wifiChangeMs = 0;
+
+String wifiStatusJson();
 
 constexpr int8_t statusRxPin = D5;  // GPIO14, tap on controller -> panel status.
 constexpr int8_t panelRxPin = D6;   // GPIO12, panel side of split command wire.
@@ -57,6 +70,21 @@ Press a preset again or any physical button to interrupt preset travel.</p>
 <button id="target-cancel" type="button" disabled>Cancel automatic move</button>
 </form>
 <p id="target-state" role="status">Automatic movement requires a fresh height display.</p>
+<details><summary>Wi-Fi settings</summary>
+<p id="wifi-state" role="status">Loading Wi-Fi status...</p>
+<p><a id="wifi-address" hidden>Open desk on home Wi-Fi</a></p>
+<form id="wifi-form">
+<p><label for="wifi-ssid">Home Wi-Fi SSID</label><br>
+<input id="wifi-ssid" type="text" maxlength="32" required autocomplete="off" disabled></p>
+<p><label for="wifi-password">Wi-Fi password</label><br>
+<input id="wifi-password" type="password" maxlength="63" autocomplete="off" disabled></p>
+<p>Use a 2.4 GHz network. Leave the password blank for an open network.
+Saving replaces the previous settings; the saved password is never shown.</p>
+<button id="wifi-save" type="submit" disabled>Save and connect</button>
+<button id="wifi-forget" type="button" disabled>Forget network</button>
+</form>
+<p id="wifi-message" role="status"></p>
+</details>
 <details open><summary>UART diagnostics</summary><pre id="diagnostics"></pre></details>
 <script>
 const height=document.getElementById('height');
@@ -70,10 +98,46 @@ const targetHeight=document.getElementById('target-height');
 const targetSubmit=document.getElementById('target-submit');
 const targetCancel=document.getElementById('target-cancel');
 const targetState=document.getElementById('target-state');
+const wifiForm=document.getElementById('wifi-form');
+const wifiSsid=document.getElementById('wifi-ssid');
+const wifiPassword=document.getElementById('wifi-password');
+const wifiSave=document.getElementById('wifi-save');
+const wifiForget=document.getElementById('wifi-forget');
+const wifiState=document.getElementById('wifi-state');
+const wifiAddress=document.getElementById('wifi-address');
+const wifiMessage=document.getElementById('wifi-message');
 const presetButtons=[...document.querySelectorAll('[data-preset]')];
 const moveButtons=[...document.querySelectorAll('[data-direction]')];
 let available=false, presetPending=false, hold=null, remoteId=null;
 let targetReady=false, targetActive=false, targetId=null, targetRequest=null;
+let wifiReady=false, wifiSaved=false, wifiEdited=false, wifiPending=false;
+function updateWifiControls(){
+  wifiSsid.disabled=wifiPassword.disabled=wifiSave.disabled=wifiPending || !wifiReady;
+  wifiForget.disabled=wifiPending || !wifiReady || !wifiSaved;
+}
+function showWifi(data){
+  wifiReady=data.storage_ready;
+  wifiSaved=data.configured;
+  if(!wifiEdited)wifiSsid.value=data.ssid;
+  wifiAddress.hidden=!data.connected;
+  if(data.connected){
+    wifiAddress.href='http://'+data.ip+'/';
+    wifiAddress.textContent='http://'+data.ip+'/';
+  }
+  if(data.state==='applying')wifiState.textContent='Applying Wi-Fi settings...';
+  else if(data.connected)wifiState.textContent='Connected to '+data.station_ssid
+    +'. Switch to your home Wi-Fi to open the address above.'
+    +(data.ap_active ? ' Backup Wi-Fi closes after 30 seconds connected.' : '');
+  else if(data.ap_active)wifiState.textContent='Backup network: '+data.ap_ssid
+    +' at http://'+data.ap_ip+'/'
+    +(data.configured ? '. Still trying your home Wi-Fi.' : '. Enter your home Wi-Fi settings below.');
+  else wifiState.textContent='Connecting to '+data.ssid+'. Backup Wi-Fi in '
+    +Math.ceil(data.fallback_remaining_ms/1000)+' seconds.';
+  if(!wifiReady)wifiState.textContent+=' Settings storage unavailable.';
+  updateWifiControls();
+}
+wifiSsid.addEventListener('input',()=>{wifiEdited=true;});
+wifiPassword.addEventListener('input',()=>{wifiEdited=true;});
 function updateControls(){
   const busy=presetPending || targetActive || targetRequest!==null;
   for(const button of presetButtons)button.disabled=!available || busy || hold!==null;
@@ -94,6 +158,33 @@ async function command(path, args){
     return data;
   }finally{clearTimeout(timeout);}
 }
+wifiForm.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(wifiPending || !wifiReady)return;
+  wifiPending=true;
+  updateWifiControls();
+  try{
+    const data=await command('wifi',{ssid:wifiSsid.value,password:wifiPassword.value});
+    wifiPassword.value='';
+    wifiEdited=false;
+    showWifi(data);
+    wifiMessage.textContent='Saved. Connecting to your home Wi-Fi.';
+  }catch(error){wifiMessage.textContent='Could not save Wi-Fi: '+error.message;}
+  finally{wifiPending=false;updateWifiControls();}
+});
+wifiForget.addEventListener('click',async()=>{
+  if(wifiPending || !wifiReady || !wifiSaved)return;
+  wifiPending=true;
+  updateWifiControls();
+  try{
+    const data=await command('wifi/forget',{});
+    wifiPassword.value='';
+    wifiEdited=false;
+    showWifi(data);
+    wifiMessage.textContent='Network forgotten. Join '+data.ap_ssid+' and open http://192.168.4.1/.';
+  }catch(error){wifiMessage.textContent='Could not forget Wi-Fi: '+error.message;}
+  finally{wifiPending=false;updateWifiControls();}
+});
 async function releaseCommand(id){
   try{await command('release',{id});}
   catch(error){if(hold===null)controlState.textContent='Release request failed: '+error.message;}
@@ -214,6 +305,7 @@ async function poll(){
       +data.state.replaceAll('_',' ');
     panel.textContent=data.panel_fresh ? 'Panel traffic received' : 'No recent panel traffic';
     diagnostics.textContent=JSON.stringify(data,null,2);
+    if(data.wifi)showWifi(data.wifi);
     available=data.remote_ready;
     targetReady=data.target_ready;
     targetActive=data.target_active;
@@ -239,6 +331,10 @@ async function poll(){
     remoteId=null;
     endHold('Monitor unreachable');
     controlState.textContent='Monitor unreachable';
+    wifiReady=false;
+    wifiAddress.hidden=true;
+    wifiState.textContent='Monitor unreachable. Rejoin home Wi-Fi or the backup network.';
+    updateWifiControls();
     updateControls();
   }finally{
     clearTimeout(timeout);
@@ -492,9 +588,133 @@ void sendStatus() {
   json += F(",\"panel_fresh\":"); json += panel.fresh(now) ? "true" : "false";
   json += F(",\"stale_after_ms\":"); json += DeskMonitor::staleMs;
   json += F(",\"uptime_ms\":"); json += now;
-  json += F(",\"passthrough_enabled\":true,\"commands_enabled\":true}");
+  json += F(",\"passthrough_enabled\":true,\"commands_enabled\":true,\"wifi\":");
+  json += wifiStatusJson();
+  json += '}';
   server.sendHeader(F("Cache-Control"), F("no-store"));
   server.send(200, F("application/json"), json);
+}
+
+struct DeskWifiNetwork {
+  bool isConnected() const {
+    return WiFi.status() == WL_CONNECTED && uint32_t(WiFi.localIP()) != 0;
+  }
+  void connect(bool keepAp) {
+    WiFi.mode(keepAp ? WIFI_AP_STA : WIFI_STA);
+    WiFi.disconnect(false);
+    WiFi.hostname(deviceName);
+    WiFi.begin(wifiCredentials.ssid, wifiCredentials.password);
+  }
+  void disconnect() {
+    WiFi.disconnect(false);
+    WiFi.mode(WIFI_AP);
+  }
+  bool startAp(bool station) {
+    WiFi.mode(station ? WIFI_AP_STA : WIFI_AP);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+    return WiFi.softAP(deviceName.c_str(), apPassword);
+  }
+  void stopAp() {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
+} wifiNetwork;
+
+String jsonQuoted(const String &text) {
+  String quoted = "\"";
+  for (unsigned i = 0; i < text.length(); ++i) {
+    const uint8_t byte = static_cast<uint8_t>(text[i]);
+    if (byte == '"' || byte == '\\') quoted += '\\';
+    if (byte < 0x20) {
+      char escaped[7];
+      snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
+      quoted += escaped;
+    } else quoted += static_cast<char>(byte);
+  }
+  quoted += '"';
+  return quoted;
+}
+
+String wifiStatusJson() {
+  String json;
+  json.reserve(512);
+  json = F("{\"configured\":"); json += wifiCredentials.valid() ? "true" : "false";
+  json += F(",\"storage_ready\":"); json += wifiStorageReady ? "true" : "false";
+  json += F(",\"ssid\":"); json += jsonQuoted(wifiCredentials.ssid);
+  json += F(",\"password_saved\":"); json += wifiCredentials.password[0] ? "true" : "false";
+  json += F(",\"state\":");
+  json += jsonQuoted(wifiChange != WifiChange::None ? "applying" : wifiConnection.stateName());
+  json += F(",\"connected\":"); json += wifiConnection.connected ? "true" : "false";
+  json += F(",\"station_ssid\":");
+  json += jsonQuoted(wifiConnection.connected ? WiFi.SSID() : String(""));
+  json += F(",\"ip\":");
+  json += jsonQuoted(wifiConnection.connected ? WiFi.localIP().toString() : String(""));
+  json += F(",\"hostname\":"); json += jsonQuoted(deviceName + ".local");
+  json += F(",\"ap_active\":"); json += wifiConnection.apActive ? "true" : "false";
+  json += F(",\"ap_ssid\":"); json += jsonQuoted(deviceName);
+  json += F(",\"ap_ip\":");
+  json += jsonQuoted(wifiConnection.apActive ? WiFi.softAPIP().toString() : String(""));
+  json += F(",\"fallback_remaining_ms\":"); json += wifiConnection.fallbackRemaining(millis());
+  json += F(",\"ap_grace_ms\":"); json += WifiConnection::apGraceMs;
+  json += '}';
+  return json;
+}
+
+void sendWifiStatus() {
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(200, F("application/json"), wifiStatusJson());
+}
+
+void saveWifiSettings() {
+  const String ssid = server.arg("ssid"), password = server.arg("password");
+  WifiCredentials saved;
+  if (!server.hasArg("ssid") || !server.hasArg("password")
+      || ssid.length() != strlen(ssid.c_str()) || password.length() != strlen(password.c_str())
+      || !saved.set(ssid.c_str(), password.c_str())) {
+    server.send(400, F("application/json"),
+        F("{\"error\":\"SSID must be 1 to 32 bytes; password must be empty or 8 to 63 bytes\"}"));
+    return;
+  }
+  if (!wifiStorageReady || !wifiStore.save(LittleFS, saved)) {
+    server.send(500, F("application/json"), F("{\"error\":\"Could not save Wi-Fi settings\"}"));
+    return;
+  }
+  wifiCredentials = saved;
+  wifiChange = WifiChange::Connect;
+  wifiChangeMs = millis();
+  sendWifiStatus();
+}
+
+void forgetWifiSettings() {
+  if (!wifiStorageReady || !wifiStore.forget(LittleFS)) {
+    server.send(500, F("application/json"), F("{\"error\":\"Could not remove Wi-Fi settings\"}"));
+    return;
+  }
+  wifiCredentials = WifiCredentials();
+  wifiChange = WifiChange::Forget;
+  wifiChangeMs = millis();
+  sendWifiStatus();
+}
+
+void serviceWifi() {
+  const uint32_t now = millis();
+  if (wifiChange != WifiChange::None) {
+    // Let the HTTP reply leave before changing its network interface.
+    if (uint32_t(now - wifiChangeMs) < 500) return;
+    if (mdnsRunning) { MDNS.end(); mdnsRunning = false; }
+    wifiConnection.configure(wifiChange == WifiChange::Connect, wifiNetwork, now);
+    wifiChange = WifiChange::None;
+  }
+  wifiConnection.update(wifiNetwork, now);
+  if (wifiConnection.connected && !mdnsRunning) {
+    mdnsRunning = MDNS.begin(deviceName.c_str());
+    if (mdnsRunning) MDNS.addService("http", "tcp", 80);
+  } else if (!wifiConnection.connected && mdnsRunning) {
+    MDNS.end();
+    mdnsRunning = false;
+  }
+  if (mdnsRunning) MDNS.update();
 }
 
 void setup() {
@@ -506,9 +726,11 @@ void setup() {
   pinMode(deskTxPin, OUTPUT);
 
   WiFi.persistent(false);
-  WiFi.mode(WIFI_AP);
-  const String ssid = "standing-desk-" + String(ESP.getChipId(), HEX);
-  const bool apStarted = WiFi.softAP(ssid.c_str(), apPassword);
+  WiFi.setAutoReconnect(true);
+  deviceName = "standing-desk-" + String(ESP.getChipId(), HEX);
+  wifiStorageReady = LittleFS.begin();
+  if (wifiStorageReady) wifiStore.load(LittleFS, wifiCredentials);
+  wifiConnection.configure(wifiCredentials.valid(), wifiNetwork, millis());
   server.on("/", HTTP_GET, []() {
     server.sendHeader(F("Cache-Control"), F("no-store"));
     server.send_P(200, "text/html; charset=utf-8", page);
@@ -519,6 +741,9 @@ void setup() {
   server.on("/api/release", HTTP_POST, releaseDesk);
   server.on("/api/target", HTTP_POST, setTarget);
   server.on("/api/target/cancel", HTTP_POST, cancelTarget);
+  server.on("/api/wifi", HTTP_GET, sendWifiStatus);
+  server.on("/api/wifi", HTTP_POST, saveWifiSettings);
+  server.on("/api/wifi/forget", HTTP_POST, forgetWifiSettings);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
@@ -527,13 +752,13 @@ void setup() {
   statusSerial.begin(9600, SWSERIAL_8N1, statusRxPin, -1, false, 256, 2560);
   panelSerial.begin(9600, SWSERIAL_8N1, panelRxPin, deskTxPin, false, 256, 2560);
   panelSerial.enableIntTx(true);
-  Serial.println(apStarted ? F("Desk panel bridge ready; HTTP at 192.168.4.1")
-                           : F("Wi-Fi AP failed; panel bridge remains active"));
+  Serial.println(F("Desk panel bridge ready; Wi-Fi setup/status at /api/wifi"));
 }
 
 void loop() {
   serviceSerial();
   server.handleClient();
   serviceSerial();
+  serviceWifi();
   yield();
 }
