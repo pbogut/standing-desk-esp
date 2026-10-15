@@ -146,8 +146,9 @@ and physical forwarding still need verification on the replacement.
 ## Home Wi-Fi setup and backup network
 
 1. On the setup access point, open **http://192.168.4.1/**.
-2. Expand **Wi-Fi settings**, enter your **2.4 GHz** network's SSID and password,
-   and choose **Save and connect**.
+2. Expand **Wi-Fi settings** and choose **Scan networks**. Select your **2.4 GHz**
+   network from **Nearby networks**, enter its password, and choose **Save and
+   connect**. You can also type an SSID manually, including a hidden network.
 3. The page shows the connection status and home-network IP. Switch your phone or
    laptop to your home Wi-Fi and open that IP address.
 
@@ -163,6 +164,21 @@ clear them. The stored record is versioned and checksummed; failed updates retai
 the old record. Passwords are never returned in API/status responses or logs.
 Saving replaces both settings; an empty password explicitly selects an open
 network, rather than reusing a previously saved password.
+
+Scanning lists up to 20 strongest visible networks, with signal strength in dBm
+and an open/password-protected label. A value closer to zero means a stronger
+signal. Repeated access points with the same SSID/security are merged using the
+strongest signal. Selecting a network only fills the SSID; it does not connect or
+save anything until you choose **Save and connect**. The D1 Mini cannot scan
+5 GHz networks. Hidden networks still require manual SSID entry.
+
+Scans run asynchronously so panel forwarding and web diagnostics stay serviced.
+Connection retries and backup AP shutdown pause during a scan; afterward retries
+resume and a connected backup AP gets a fresh 30-second grace period. The page
+shows scanning, no-results, and failure states. Scans have a 15-second timeout.
+Settings cannot be saved or forgotten while a scan is running, and scanning is
+unavailable during a pending settings change or the initial AP-less connection
+attempt. An existing setup/backup AP stays available while scanning.
 
 Connection behavior:
 
@@ -188,7 +204,17 @@ The API uses the current interface's IP address:
   fallback countdown, and storage availability. It does not include the password.
 - `POST /api/wifi`: form fields `ssid` and `password`, saved before connecting.
 - `POST /api/wifi/forget`: remove saved settings and return to the setup AP.
+- `POST /api/wifi/scan`: start an asynchronous scan, returning HTTP 202. Repeating
+  this while a scan runs observes the same scan rather than starting another.
+- `GET /api/wifi/scan`: read scan `state`, `error`, and `networks`. Each network
+  has `ssid`, `rssi`, and `secured`; results are sorted by strongest signal first.
 - `GET /api/status`: includes the same information in its `wifi` object.
+
+`/api/wifi` also reports `scan_state`. A scan can be `idle`, `running`, `complete`,
+or `failed`. A completed scan with no nearby networks has an empty list. The SDK
+result buffer is released after collection; the bounded result list remains in
+RAM until the next scan or reboot. Scan requests return HTTP 409 when Wi-Fi is
+busy changing settings/connecting, or HTTP 500 if scanning could not start.
 
 The SSID must be 1..32 bytes. Passwords must be 8..63 bytes, or empty for an open
 network. Invalid fields return HTTP 400; storage failures return HTTP 500 and
@@ -406,6 +432,9 @@ or software-UART timing with Wi-Fi. Wi-Fi tests cover persisted-record recovery,
 failed writes/renames/removal, malformed records, fallback/retry/grace periods,
 timer wraparound, credential validation, password omission, escaped SSIDs,
 deferred network changes, and settings-page interactions.
+Scan tests also cover sorted/deduplicated/bounded results, hidden SSID omission,
+async SDK calls, overlapping requests, errors/timeouts, retry coordination,
+AP grace periods, safe network selection, and scan polling/recovery.
 
 ## First desk test
 
@@ -462,3 +491,6 @@ during connection attempts. To check fallback, make the home network unavailable
 for at least 60 seconds and confirm the backup AP appears, then restore home Wi-Fi
 and confirm reconnection and eventual AP shutdown. `/api/wifi` reports the state
 and remaining fallback time.
+Also check **Scan networks**, select a nearby SSID, and confirm that its name is
+filled in without changing the password or saving automatically. Verify that the
+physical panel and diagnostics still work while the scan is running.

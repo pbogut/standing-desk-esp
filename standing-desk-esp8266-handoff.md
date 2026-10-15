@@ -24,6 +24,9 @@ With saved settings, the ESP tries home Wi-Fi and starts its backup AP after
 60 seconds offline. The AP stays available during setup and closes after a
 30-second stable home connection. Wi-Fi setup and fallback still need a physical
 test. Connection attempts are non-blocking so the panel bridge remains serviced.
+The Wi-Fi settings page also scans asynchronously for nearby 2.4 GHz networks,
+shows signal/security information, and fills the SSID from a selectable list.
+Scanning pauses retries and AP shutdown, and leaves saved credentials unchanged.
 The replacement-panel proposal and stages below are the original handoff; their
 wiring and keypad-absence tests do not describe the current inline adapter.
 

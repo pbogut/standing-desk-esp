@@ -54,6 +54,7 @@ struct IPAddress {
 };
 enum { WIFI_STA, WIFI_AP, WIFI_AP_STA, WL_CONNECTED, ENC_TYPE_NONE, ENC_TYPE_CCMP,
        WIFI_SCAN_RUNNING=-1, WIFI_SCAN_FAILED=-2 };
+extern uint32_t now;
 struct FakeWifi {
   bool online = false, ap = false;
   unsigned connections = 0;
@@ -62,6 +63,7 @@ struct FakeWifi {
   std::vector<ScanNetwork> scanResults;
   int scanResult=WIFI_SCAN_FAILED, scanStartResult=WIFI_SCAN_RUNNING;
   unsigned scanStarts=0, scanDeletes=0;
+  uint32_t scanDeleteDelay=0;
   bool autoReconnect=true;
   int status() const { return online ? WL_CONNECTED : -1; }
   IPAddress localIP() const { return online ? IPAddress(192,168,1,50) : IPAddress(0,0,0,0); }
@@ -76,7 +78,9 @@ struct FakeWifi {
     ++scanStarts; scanResult=scanStartResult; return scanResult;
   }
   int scanComplete() const { return scanResult; }
-  void scanDelete() { ++scanDeletes; scanResults.clear(); scanResult=WIFI_SCAN_FAILED; }
+  void scanDelete() {
+    ++scanDeletes; scanResults.clear(); scanResult=WIFI_SCAN_FAILED; now+=scanDeleteDelay;
+  }
   void mode(int mode) { if(mode == WIFI_STA) ap=false; if(mode == WIFI_AP) online=false; }
   void disconnect(bool) { online=false; }
   void hostname(const String &value) { hostName=value; }
@@ -236,10 +240,12 @@ int main() {
   WiFi.online=true; now=90002; serviceWifi();
   now=119000; startWifiScan(); response(202);
   now=120002; serviceWifi(); assert(WiFi.ap);
+  WiFi.scanDeleteDelay=1; // Scan collection can advance millis before connection servicing.
   WiFi.scanResult=0; now=120003; serviceWifi();
   assert(WiFi.ap && wifiConnection.connected);
-  now=150002; serviceWifi(); assert(WiFi.ap);
-  now=150003; serviceWifi(); assert(!WiFi.ap);
+  const uint32_t finished=now;
+  now=finished+29999; serviceWifi(); assert(WiFi.ap);
+  now=finished+30000; serviceWifi(); assert(!WiFi.ap);
 }
 '''
 

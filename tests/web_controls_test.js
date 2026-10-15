@@ -9,7 +9,9 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function element(dataset = {}) {
   return {
-    dataset, textContent: '', value: '', disabled: true, listeners: {},
+    dataset, textContent: '', value: '', disabled: true, listeners: {}, children: [],
+    replaceChildren(...nodes) { this.children = nodes; },
+    appendChild(node) { this.children.push(node); return node; },
     addEventListener(name, callback) { this.listeners[name] = callback; },
     setPointerCapture() {},
     fire(name, properties = {}) {
@@ -24,7 +26,8 @@ async function page() {
     ['height', 'state', 'panel', 'diagnostics', 'release', 'control-state', 'control-ready',
      'target-form', 'target-height', 'target-submit', 'target-cancel', 'target-state']
       .concat(['wifi-form', 'wifi-ssid', 'wifi-password', 'wifi-save', 'wifi-forget',
-               'wifi-state', 'wifi-address', 'wifi-message'])
+               'wifi-state', 'wifi-address', 'wifi-message', 'wifi-scan', 'wifi-scan-state',
+               'wifi-networks'])
       .map(id => [id, element()]));
   elements['control-ready'].textContent = 'Connecting controls...';
   const presets = [1, 2, 3].map(number => element({preset: String(number)}));
@@ -32,12 +35,14 @@ async function page() {
   const window = element();
   const document = element();
   document.getElementById = id => elements[id];
+  document.createElement = () => element();
   document.querySelectorAll = selector => selector === '[data-preset]' ? presets : moves;
   const timers = new Map();
   let timerId = 0, commandId = 0;
   const client = {
     elements, presets, moves, window, document, timers, requests: [], responses: [],
-    offline: false,
+    offline: false, scanGets: 0,
+    scanResult: {state: 'complete', error: null, networks: []},
     status: {fresh: false, height_cm: null, last_known_height_cm: null,
       state: 'waiting_for_frames', panel_fresh: true, remote_ready: true,
       remote_button: 'idle', remote_command_id: 0, target_ready: false,
@@ -55,9 +60,16 @@ async function page() {
         const snapshot = {...client.status};
         return {ok: true, json: async () => snapshot};
       }
+      if(url === '/api/wifi/scan' && !options.method){
+        ++client.scanGets;
+        if(client.scanOffline)throw new Error('Scan connection lost');
+        return {ok:true,json:async()=>client.scanResult};
+      }
       const args = Object.fromEntries(options.body);
       client.requests.push({url, args, options});
       if (client.responses.length) return client.responses.shift()(url, args);
+      if(url === '/api/wifi/scan')return {ok:true,
+        json:async()=>({state:'running',error:null,networks:[]})};
       if(url === '/api/wifi' || url === '/api/wifi/forget')return {ok: true,
         json: async () => ({...client.status.wifi, configured: url === '/api/wifi',
           ssid: args.ssid || '', state: 'applying'})};
@@ -68,6 +80,7 @@ async function page() {
   });
   client.run = code => vm.runInContext(code, context);
   client.poll = () => client.run('poll()');
+  client.pollScan = () => client.run('pollWifiScan()');
   client.renew = async () => {
     const entry = [...timers].find(([, timer]) => timer.delay === 100);
     assert(entry, 'hold renewal should be scheduled');
@@ -347,6 +360,75 @@ async function page() {
     await client.poll();
     assert.match(client.elements['wifi-state'].textContent,/Still trying/);
     assert.equal(client.elements['wifi-address'].hidden,true);
+  }
+  // Scanning is a single POST with GET polling. Selection copies literal SSID
+  // text, never HTML, and does not save or overwrite credentials automatically.
+  {
+    const client=await page();
+    client.elements['wifi-ssid'].value='Manual entry';
+    client.elements['wifi-password'].value='my-password';
+    await client.elements['wifi-scan'].fire('click');
+    assert.equal(client.requests[0].url,'/api/wifi/scan');
+    assert(client.elements['wifi-scan'].disabled);
+    assert(client.elements['wifi-save'].disabled);
+    await client.elements['wifi-scan'].fire('click');
+    assert.equal(client.requests.length,1);
+    client.scanResult={state:'running',error:null,networks:[]};
+    await client.pollScan();
+    assert(client.elements['wifi-scan'].disabled);
+    client.scanResult={state:'complete',error:null,networks:[
+      {ssid:'<b>Home</b>',rssi:-40,secured:true},{ssid:'Open',rssi:-70,secured:false}]};
+    await client.pollScan();
+    const choices=client.elements['wifi-networks'].children;
+    assert.equal(choices.length,3);
+    assert.equal(choices[1].textContent,'<b>Home</b> | -40 dBm | Password protected');
+    assert.equal(choices[2].textContent,'Open | -70 dBm | Open');
+    assert.equal(client.elements['wifi-ssid'].value,'Manual entry');
+    client.elements['wifi-networks'].value='<b>Home</b>';
+    client.elements['wifi-networks'].fire('change');
+    await client.poll();
+    assert.equal(client.elements['wifi-ssid'].value,'<b>Home</b>');
+    assert.equal(client.elements['wifi-password'].value,'my-password');
+    assert(!client.elements['wifi-networks'].disabled);
+    assert(!client.elements['wifi-scan'].disabled);
+    assert.equal(client.requests.length,1);
+  }
+  for(const failed of [false,true]){
+    const client=await page();
+    await client.elements['wifi-scan'].fire('click');
+    client.scanResult={state:failed?'failed':'complete',error:failed?'Scan timed out':null,networks:[]};
+    await client.pollScan();
+    assert.match(client.elements['wifi-scan-state'].textContent,failed?/Scan timed out/:/No networks found/);
+    assert(client.elements['wifi-networks'].disabled);
+    assert(!client.elements['wifi-scan'].disabled);
+    assert(!client.elements['wifi-ssid'].disabled);
+  }
+  {
+    const client=await page();
+    client.responses.push(async()=>({ok:false,json:async()=>({error:'Wi-Fi busy'})}));
+    await client.elements['wifi-scan'].fire('click');
+    assert.match(client.elements['wifi-scan-state'].textContent,/Wi-Fi busy/);
+    assert(!client.elements['wifi-scan'].disabled);
+    assert(!client.elements['wifi-save'].disabled);
+  }
+  {
+    const client=await page();
+    client.status.wifi.scan_state='running';
+    await client.poll();
+    assert(client.elements['wifi-scan'].disabled);
+    assert.equal(client.requests.length,0); // Observe a scan started by another tab.
+    await client.pollScan();
+    assert.equal(client.scanGets,1);
+    assert(!client.elements['wifi-scan'].disabled);
+  }
+  {
+    const client=await page();
+    await client.elements['wifi-scan'].fire('click');
+    client.scanOffline=true;
+    await client.pollScan();
+    assert.match(client.elements['wifi-scan-state'].textContent,/Scan connection lost/);
+    assert(!client.elements['wifi-scan'].disabled);
+    assert(!client.elements['wifi-save'].disabled);
   }
   console.log('All web controls tests passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

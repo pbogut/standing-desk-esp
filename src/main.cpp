@@ -77,6 +77,10 @@ Press a preset again or any physical button to interrupt preset travel.</p>
 <details><summary>Wi-Fi settings</summary>
 <p id="wifi-state" role="status">Loading Wi-Fi status...</p>
 <p><a id="wifi-address" hidden>Open desk on home Wi-Fi</a></p>
+<button id="wifi-scan" type="button" disabled>Scan networks</button>
+<p id="wifi-scan-state" role="status"></p>
+<p><label for="wifi-networks">Nearby networks</label><br>
+<select id="wifi-networks" disabled><option value="">Scan to find networks</option></select></p>
 <form id="wifi-form">
 <p><label for="wifi-ssid">Home Wi-Fi SSID</label><br>
 <input id="wifi-ssid" type="text" maxlength="32" required autocomplete="off" disabled></p>
@@ -111,18 +115,31 @@ const wifiForget=document.getElementById('wifi-forget');
 const wifiState=document.getElementById('wifi-state');
 const wifiAddress=document.getElementById('wifi-address');
 const wifiMessage=document.getElementById('wifi-message');
+const wifiScanButton=document.getElementById('wifi-scan');
+const wifiScanState=document.getElementById('wifi-scan-state');
+const wifiNetworks=document.getElementById('wifi-networks');
 const presetButtons=[...document.querySelectorAll('[data-preset]')];
 const moveButtons=[...document.querySelectorAll('[data-direction]')];
 let available=false, presetPending=false, hold=null, remoteId=null;
 let targetReady=false, targetActive=false, targetId=null, targetRequest=null;
 let wifiReady=false, wifiSaved=false, wifiEdited=false, wifiPending=false;
+let wifiScanning=false, wifiCanScan=false, wifiNetworkCount=0, wifiScanTimer=null;
 function updateWifiControls(){
-  wifiSsid.disabled=wifiPassword.disabled=wifiSave.disabled=wifiPending || !wifiReady;
-  wifiForget.disabled=wifiPending || !wifiReady || !wifiSaved;
+  wifiSsid.disabled=wifiPassword.disabled=wifiPending || !wifiReady;
+  wifiSave.disabled=wifiPending || wifiScanning || !wifiReady;
+  wifiForget.disabled=wifiPending || wifiScanning || !wifiReady || !wifiSaved;
+  wifiScanButton.disabled=wifiPending || wifiScanning || !wifiCanScan;
+  wifiNetworks.disabled=wifiPending || wifiScanning || wifiNetworkCount===0;
 }
 function showWifi(data){
   wifiReady=data.storage_ready;
   wifiSaved=data.configured;
+  wifiCanScan=data.state!=='applying' && (data.connected || data.ap_active);
+  if(data.scan_state==='running' && !wifiScanning){
+    wifiScanning=true;
+    wifiScanState.textContent='Scanning for 2.4 GHz networks...';
+    scheduleWifiScanPoll();
+  }
   if(!wifiEdited)wifiSsid.value=data.ssid;
   wifiAddress.hidden=!data.connected;
   if(data.connected){
@@ -141,8 +158,71 @@ function showWifi(data){
   if(!wifiReady)wifiState.textContent+=' Settings storage unavailable.';
   updateWifiControls();
 }
-wifiSsid.addEventListener('input',()=>{wifiEdited=true;});
+wifiSsid.addEventListener('input',()=>{wifiEdited=true;wifiNetworks.value='';});
 wifiPassword.addEventListener('input',()=>{wifiEdited=true;});
+wifiNetworks.addEventListener('change',()=>{
+  if(!wifiNetworks.value)return;
+  wifiSsid.value=wifiNetworks.value;
+  wifiEdited=true;
+});
+function scheduleWifiScanPoll(){
+  if(wifiScanTimer===null)wifiScanTimer=setTimeout(pollWifiScan,500);
+}
+function showWifiScan(data){
+  if(data.state==='running'){
+    wifiScanState.textContent='Scanning for 2.4 GHz networks...';
+    scheduleWifiScanPoll();
+    return;
+  }
+  wifiScanning=false;
+  wifiNetworks.replaceChildren();
+  wifiNetworkCount=data.networks.length;
+  const placeholder=document.createElement('option');
+  placeholder.value='';
+  placeholder.textContent=wifiNetworkCount ? 'Select a network' : 'No networks found';
+  wifiNetworks.appendChild(placeholder);
+  for(const network of data.networks){
+    const option=document.createElement('option');
+    option.value=network.ssid;
+    option.textContent=network.ssid+' | '+network.rssi+' dBm | '
+      +(network.secured ? 'Password protected' : 'Open');
+    wifiNetworks.appendChild(option);
+  }
+  wifiScanState.textContent=data.state==='failed' ? data.error || 'Scan failed. Try again.'
+    : wifiNetworkCount ? 'Select a network, then enter its password and save.'
+    : 'No networks found. Try again or type an SSID manually.';
+  updateWifiControls();
+}
+async function pollWifiScan(){
+  clearTimeout(wifiScanTimer);
+  wifiScanTimer=null;
+  const abort=new AbortController();
+  const timeout=setTimeout(()=>abort.abort(),2000);
+  try{
+    const response=await fetch('/api/wifi/scan',{cache:'no-store',signal:abort.signal});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error || 'HTTP '+response.status);
+    showWifiScan(data);
+  }catch(error){
+    wifiScanning=false;
+    wifiScanState.textContent='Could not read scan results: '+error.message;
+    updateWifiControls();
+  }finally{clearTimeout(timeout);}
+}
+wifiScanButton.addEventListener('click',async()=>{
+  if(wifiPending || wifiScanning || !wifiCanScan)return;
+  wifiScanning=true;
+  wifiNetworkCount=0;
+  wifiNetworks.replaceChildren();
+  wifiScanState.textContent='Scanning for 2.4 GHz networks...';
+  updateWifiControls();
+  try{showWifiScan(await command('wifi/scan',{}));}
+  catch(error){
+    wifiScanning=false;
+    wifiScanState.textContent='Could not start scan: '+error.message;
+    updateWifiControls();
+  }
+});
 function updateControls(){
   const busy=presetPending || targetActive || targetRequest!==null;
   for(const button of presetButtons)button.disabled=!available || busy || hold!==null;
@@ -165,7 +245,7 @@ async function command(path, args){
 }
 wifiForm.addEventListener('submit',async event=>{
   event.preventDefault();
-  if(wifiPending || !wifiReady)return;
+  if(wifiPending || wifiScanning || !wifiReady)return;
   wifiPending=true;
   updateWifiControls();
   try{
@@ -178,7 +258,7 @@ wifiForm.addEventListener('submit',async event=>{
   finally{wifiPending=false;updateWifiControls();}
 });
 wifiForget.addEventListener('click',async()=>{
-  if(wifiPending || !wifiReady || !wifiSaved)return;
+  if(wifiPending || wifiScanning || !wifiReady || !wifiSaved)return;
   wifiPending=true;
   updateWifiControls();
   try{
@@ -338,6 +418,7 @@ async function poll(){
     controlState.textContent='Monitor unreachable';
     controlReady.textContent='Controls unavailable: monitor unreachable';
     wifiReady=false;
+    wifiCanScan=false;
     wifiAddress.hidden=true;
     wifiState.textContent='Monitor unreachable. Rejoin home Wi-Fi or the backup network.';
     updateWifiControls();
@@ -788,8 +869,8 @@ void forgetWifiSettings() {
 }
 
 void serviceWifi() {
-  const uint32_t now = millis();
   serviceWifiScan();
+  const uint32_t now = millis();
   if (wifiChange != WifiChange::None) {
     // Let the HTTP reply leave before changing its network interface.
     if (uint32_t(now - wifiChangeMs) < 500) return;
