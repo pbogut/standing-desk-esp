@@ -15,6 +15,8 @@ class DeskMonitor {
   bool displayHeight = false;
   uint32_t lastFrameMs = 0, lastHeightMs = 0;
   uint32_t heightHundredths = 0;
+  char controllerError[4] = {}, lastControllerError[4] = {};
+  uint32_t lastControllerErrorMs = 0;
 
   bool fresh(uint32_t now) const {
     return hasHeight && displayNumeric && uint32_t(now - lastHeightMs) < staleMs;
@@ -25,6 +27,10 @@ class DeskMonitor {
   }
 
   void inputOverflow() { displayHeight = false; }
+
+  bool errorFresh(uint32_t now) const {
+    return controllerError[0] && uint32_t(now - lastControllerErrorMs) < staleMs;
+  }
 
   void feed(uint8_t byte, uint32_t now) {
     ++bytes;
@@ -53,6 +59,17 @@ class DeskMonitor {
     }
     ++validFrames;
     displayHeight = false;
+    controllerError[0] = 0;
+    // Preserve checksum-valid E## displays as codes, without guessing their meaning.
+    const int second = decodeDigit(buffer_[2]), third = decodeDigit(buffer_[3]);
+    if (buffer_[1] == 0x79 && second >= 0 && third >= 0) {
+      controllerError[0] = 'E';
+      controllerError[1] = '0' + second;
+      controllerError[2] = '0' + third;
+      controllerError[3] = 0;
+      memcpy(lastControllerError, controllerError, sizeof(controllerError));
+      lastControllerErrorMs = now;
+    }
     uint16_t value = 0;
     int decimal = -1;
     displayNumeric = true;

@@ -8,7 +8,10 @@ import tempfile
 root = Path(__file__).resolve().parent.parent
 source = (root / "src/main.cpp").read_text()
 service = source[source.index("void serviceSerial() {"):source.index("const char *remoteButtonName()")]
+button_name = source[source.index("const char *remoteButtonName()"):source.index("void appendTargetStatus(")]
 handlers = source[source.index("void appendTargetStatus("):source.index("String heightString()")]
+status = source[source.index("String heightString() {"):source.index("String mqttStatusJson() {")]
+quoted = source[source.index("String jsonQuoted(const String &text) {"):source.index("String wifiStatusJson() {")]
 for route, handler in [("target", "setTarget"), ("target/cancel", "cancelTarget")]:
     assert f'server.on("/api/{route}", HTTP_POST, {handler});' in source
 
@@ -16,6 +19,7 @@ stub = r'''
 #include "target_move.h"
 #include <cassert>
 #include <iostream>
+#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -26,6 +30,10 @@ class String : public std::string {
   using std::string::operator+=;
   explicit String(uint32_t number) : std::string(std::to_string(number)) {}
   String &operator+=(uint32_t number) { append(std::to_string(number)); return *this; }
+  String &operator+=(uint16_t number) { append(std::to_string(number)); return *this; }
+  String(double number, unsigned decimals) {
+    char text[32]; snprintf(text, sizeof(text), "%.*f", decimals, number); assign(text);
+  }
 };
 struct FakeServer {
   std::map<std::string, String> args;
@@ -58,7 +66,12 @@ DeskMonitor desk;
 PanelBridge panel;
 TargetMove target;
 uint32_t now = 0, uartOverruns = 0, panelUartOverruns = 0;
+uint32_t lastSerialServiceMs = 0, maxSerialServiceGapMs = 0;
+bool serialServiceSeen = false;
 uint32_t millis() { return now; }
+struct FakeEsp { uint32_t getFreeHeap() const { return 40000; } } ESP;
+String wifiStatusJson() { return String("{}"); }
+String mqttStatusJson() { return String("{}"); }
 void height(uint16_t value) {
   const uint8_t codes[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
   const bool decimal = value < 10000;
@@ -248,6 +261,18 @@ int main() {
     assert(panel.commandButton == 0);
     assert(panelSerial.output[panelSerial.output.size() - 3] == 0);
   }
+  desk=DeskMonitor(); panel=PanelBridge(); target=TargetMove();
+  panelSerial=FakeSerial(); statusSerial=FakeSerial();
+  now=0;serialServiceSeen=false;maxSerialServiceGapMs=0;
+  height(7000);idle();sendStatus();result(200);
+  now=10;
+  statusSerial.input.insert(statusSerial.input.end(),{0x5A,0x79,0x3F,0x66,0x10,0x2E});
+  sendStatus();result(200);
+  assert(desk.errorFresh(now));
+  now=20;height(7000);idle();sendStatus();result(200);
+  assert(!desk.errorFresh(now) && !strcmp(desk.lastControllerError,"E04"));
+  now=2020;idle();sendStatus();result(200);
+  assert(maxSerialServiceGapMs==2000 && panel.wakeCount==5);
 }
 '''
 
@@ -255,16 +280,30 @@ with tempfile.TemporaryDirectory(prefix="api-test-", dir=root / ".pio") as direc
     binary = str(Path(directory) / "command_api_test")
     subprocess.run(["g++", "-x", "c++", "-std=c++11", "-Wall", "-Wextra", "-Werror",
                     "-pedantic", "-fsanitize=address,undefined", "-I", str(root / "include"),
-                    "-", "-o", binary], input=stub + service + handlers + checks,
+                   "-", "-o", binary], input=stub + service + button_name + handlers + quoted + status + checks,
                    text=True, check=True)
     completed = subprocess.run([binary], capture_output=True, text=True)
     if completed.returncode:
         print(completed.stderr)
         completed.check_returncode()
+    status_bodies = []
     for line in completed.stdout.splitlines():
         body = json.loads(line)
+        if "firmware_build" in body:
+            status_bodies.append(body)
+            assert body["panel_passthrough"] == "immediate_when_idle"
+            assert body["panel_buffered_bytes"] == 0
+            assert body["free_heap_bytes"] == 40000
+            capture = body["panel_wake_capture"]
+            assert len(capture["bytes"].split()) == len(capture["read_offsets_ms"]) <= 32
+            continue
         assert isinstance(body["command_id"], int)
         assert isinstance(body["automatic_height_valid"], bool)
         assert isinstance(body["target_active"], bool)
         assert body["target_state"] in ["idle", "moving", "complete", "cancelled"]
+    assert status_bodies[1]["controller_error"] == "E04"
+    assert status_bodies[1]["height_cm"] is None
+    assert status_bodies[2]["controller_error"] is None
+    assert status_bodies[2]["last_controller_error"] == "E04"
+    assert status_bodies[3]["max_serial_service_gap_ms"] == 2000
 print("All command API and serial integration tests passed.")

@@ -150,6 +150,16 @@ async function page() {
     assert(client.moves.every(button => button.disabled));
   }
 
+  // A controller error is shown without treating its digits as a live height.
+  {
+    const client=await page();
+    Object.assign(client.status,{controller_error:'E04',state:'unsupported_display',
+      fresh:false,last_known_height_cm:70});
+    await client.poll();
+    assert.equal(client.elements.height.textContent,'70 cm');
+    assert.equal(client.elements.state.textContent,'Last known height. Controller display: E04');
+  }
+
   // Each preset submits exactly once, with POST form fields and no retries.
   for (let number = 1; number <= 3; ++number) {
     const client = await page();

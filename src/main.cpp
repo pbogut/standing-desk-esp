@@ -26,6 +26,8 @@ SoftwareSerial statusSerial;
 SoftwareSerial panelSerial;
 ESP8266WebServer server(80);
 uint32_t uartOverruns = 0, panelUartOverruns = 0;
+uint32_t lastSerialServiceMs = 0, maxSerialServiceGapMs = 0;
+bool serialServiceSeen = false;
 WifiCredentials wifiCredentials;
 WifiCredentialStore wifiStore;
 WifiConnection wifiConnection;
@@ -468,7 +470,7 @@ async function poll(){
     const shownHeight=data.fresh ? data.height_cm : data.last_known_height_cm;
     height.textContent=shownHeight!==null ? shownHeight+' cm' : 'No reading';
     state.textContent=(!data.fresh && shownHeight!==null ? 'Last known height. ' : '')
-      +data.state.replaceAll('_',' ');
+      +(data.controller_error ? 'Controller display: '+data.controller_error : data.state.replaceAll('_',' '));
     panel.textContent=data.panel_fresh ? 'Panel traffic received' : 'No recent panel traffic';
     diagnostics.textContent=JSON.stringify(data,null,2);
     if(data.wifi)showWifi(data.wifi);
@@ -517,6 +519,11 @@ poll();
 </script></html>)HTML";
 
 void serviceSerial() {
+  const uint32_t serviceMs = millis();
+  if (serialServiceSeen && uint32_t(serviceMs - lastSerialServiceMs) > maxSerialServiceGapMs)
+    maxSerialServiceGapMs = serviceMs - lastSerialServiceMs;
+  lastSerialServiceMs = serviceMs;
+  serialServiceSeen = true;
   if (panelSerial.overflow()) {
     ++panelUartOverruns;
     panel.inputOverflow(millis());
@@ -706,8 +713,8 @@ void sendStatus() {
   const char *state = fresh ? "fresh" : desk.validFrames == 0 ? "waiting_for_frames"
       : !desk.displayNumeric ? "unsupported_display" : "stale";
   String json;
-  json.reserve(2560);
-  json = F("{\"state\":\"");
+  json.reserve(3072);
+  json = F("{\"firmware_build\":\"" __DATE__ " " __TIME__ "\",\"state\":\"");
   json += state;
   json += F("\",\"fresh\":");
   json += fresh ? "true" : "false";
@@ -742,6 +749,32 @@ void sendStatus() {
   json += F(",\"panel_bytes_forwarded\":"); json += panel.bytesForwarded;
   json += F(",\"panel_write_failures\":"); json += panel.writeFailures;
   json += F(",\"panel_uart_overruns\":"); json += panelUartOverruns;
+  json += F(",\"panel_passthrough\":\"immediate_when_idle\",\"panel_buffered_bytes\":");
+  json += panel.bufferedBytes();
+  json += F(",\"remote_stop_reason\":"); json += jsonQuoted(panel.stopReason);
+  json += F(",\"max_serial_service_gap_ms\":"); json += maxSerialServiceGapMs;
+  json += F(",\"free_heap_bytes\":"); json += ESP.getFreeHeap();
+  json += F(",\"controller_error\":");
+  json += desk.errorFresh(now) ? jsonQuoted(desk.controllerError) : String("null");
+  json += F(",\"last_controller_error\":");
+  json += desk.lastControllerError[0] ? jsonQuoted(desk.lastControllerError) : String("null");
+  json += F(",\"last_controller_error_age_ms\":");
+  json += desk.lastControllerError[0] ? String(uint32_t(now - desk.lastControllerErrorMs)) : String("null");
+  json += F(",\"panel_wake_capture\":{\"age_ms\":");
+  json += panel.wakeCount ? String(uint32_t(now - panel.wakeStartMs)) : String("null");
+  json += F(",\"bytes\":\"");
+  for (unsigned i = 0; i < panel.wakeCount; ++i) {
+    char hex[4];
+    snprintf(hex, sizeof(hex), "%02X", panel.wakeBytes[i]);
+    if (i) json += ' ';
+    json += hex;
+  }
+  json += F("\",\"read_offsets_ms\":[");
+  for (unsigned i = 0; i < panel.wakeCount; ++i) {
+    if (i) json += ',';
+    json += panel.wakeReadOffsetsMs[i];
+  }
+  json += F("]}");
   json += F(",\"panel_bytes_suppressed\":"); json += panel.bytesSuppressed;
   json += F(",\"esp_bytes_sent\":"); json += panel.espBytesSent;
   json += F(",\"panel_invalid_frames\":"); json += panel.invalidFrames;

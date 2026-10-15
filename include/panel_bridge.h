@@ -20,6 +20,11 @@ class PanelBridge {
   uint32_t commandId = 0;
   uint8_t commandButton = 0;
   const char *stopReason = "idle";
+  uint8_t wakeBytes[32] = {}, wakeCount = 0;
+  uint16_t wakeReadOffsetsMs[32] = {};
+  uint32_t wakeStartMs = 0;
+
+  unsigned bufferedBytes() const { return used_ - forwarded_; }
 
   bool fresh(uint32_t now) const {
     return bytesReceived != 0 && uint32_t(now - lastByteMs) < staleMs;
@@ -111,6 +116,15 @@ class PanelBridge {
     for (unsigned count = 0; count < bytesPerPass && port.available(); ++count) {
       const int byte = port.read();
       if (byte < 0) break;
+      if (!bytesReceived || uint32_t(now - lastByteMs) >= staleMs) {
+        wakeCount = 0;
+        wakeStartMs = now;
+      }
+      if (wakeCount < sizeof(wakeBytes)) {
+        wakeBytes[wakeCount] = static_cast<uint8_t>(byte);
+        const uint32_t offset = now - wakeStartMs;
+        wakeReadOffsetsMs[wakeCount++] = offset > 65535 ? 65535 : offset;
+      }
       ++bytesReceived;
       lastByteMs = now;
       if (!used_ && byte != 0xA5) {

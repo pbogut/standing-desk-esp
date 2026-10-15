@@ -89,6 +89,10 @@ int main() {
     assert((serial.output == std::vector<uint8_t>{0xA5}));
     input(remote, serial, {0, 0x20}, 1001);
     assert((serial.output == std::vector<uint8_t>{0xA5, 0, 0x20}));
+    assert(remote.wakeCount == 3 && remote.wakeStartMs == 1000);
+    assert(remote.wakeBytes[0] == 0xA5 && remote.wakeBytes[2] == 0x20);
+    assert(remote.wakeReadOffsetsMs[0] == 0 && remote.wakeReadOffsetsMs[2] == 1);
+    assert(remote.bufferedBytes() == 0);
     remote.forward(serial, 1031);
     assert((serial.output == std::vector<uint8_t>{0xA5, 0, 0x20}));
     assert(remote.partialTimeouts == 1);
@@ -97,6 +101,10 @@ int main() {
     input(remote, serial, {0, 0x40}, 1041);
     assert(serial.output == serial.input && remote.invalidFrames == 1);
     assert(remote.bytesReceived == remote.bytesForwarded);
+    for (unsigned i = 0; i < 40; ++i) input(remote, serial, {0}, 1050);
+    assert(remote.wakeCount == 32);
+    input(remote, serial, {0xA5}, 2050);
+    assert(remote.wakeCount == 1 && remote.wakeStartMs == 2050 && remote.wakeBytes[0] == 0xA5);
   }
 
   // A request arriving after a physical frame's prefix was forwarded must finish

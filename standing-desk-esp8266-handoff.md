@@ -10,6 +10,16 @@ is split; controller status and panel power remain connected straight through.
 GPIO1/TX and GPIO3/RX are reserved for USB. See `README.md` for the current wiring,
 power options, flashing instructions, and passthrough test.
 
+The desk model was identified from its purchase confirmation as Spacetronik
+SPE-243LW. With the adapter attached, the owner observed a black/unresponsive
+panel after sleep. A later physical press displayed `E04` and restored operation
+without an ESP reboot. Live diagnostics showed web commands accepted, no panel
+traffic during the failure, and normal traffic after recovery. The published
+SPE-243 error table does not explain E04. Idle forwarding now passes each panel
+byte immediately rather than waiting for a full frame. The next firmware adds a
+passive first-32-byte wake capture, latched E## codes and loop/heap diagnostics.
+This timing correction still needs the owner's sleep/wake test.
+
 The firmware forwards panel traffic, reports height, and adds web/API preset,
 hold-to-move, and automatic target-height controls. Physical panel presses cancel
 ESP control and pass through. The owner has verified height reporting, panel

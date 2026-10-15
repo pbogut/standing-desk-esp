@@ -59,13 +59,19 @@ after confirming the supply supports the ESP's Wi-Fi current peaks. Disconnect
 USB when using that tap unless this board's power isolation has been verified.
 Never connect contact 7 to 3V3.
 
-Both software UART receivers remain active during transmission. The bridge
-buffers five-byte panel frames and forwards idle, movement, preset, and
-programming traffic. While an ESP button is active, panel idle frames are
-suppressed and ESP button frames are sent roughly every 10 ms. Any non-idle panel
-frame cancels ESP control and passes through. Unknown and corrupt traffic also
-passes through; corrupt traffic cancels ESP control. Forwarding adds latency and
-exact packet gaps are not preserved.
+Both software UART receivers remain active during transmission. When ESP control
+is idle, physical panel bytes are forwarded immediately as they are read, with
+no five-byte-frame wait. A copy is parsed for arbitration. This preserves short,
+unknown, and partial wake-up traffic instead of holding it for a frame timeout.
+If a remote request arrives after part of a physical frame has been forwarded,
+that frame finishes unchanged before the first synthetic command is inserted.
+
+While an ESP button/release is active, five-byte panel frames are buffered so
+idle frames can be suppressed and ESP button frames sent roughly every 10 ms.
+Any non-idle panel frame cancels ESP control and passes through. Unknown and
+corrupt traffic also passes through; corrupt traffic cancels ESP control.
+This remains a software bridge, so scheduling and software-UART transmission
+can add latency; exact electrical timing is not preserved.
 
 Panel buttons require working ESP firmware and are unavailable during boot,
 reset, or flashing. The panel display receives status directly. If the ESP fails,
@@ -328,6 +334,25 @@ curl http://192.168.4.1/api/status
 ```
 
 - `state` is `waiting_for_frames`, `fresh`, `stale`, or `unsupported_display`.
+- `firmware_build` identifies the compiled image by build date/time.
+- `panel_passthrough` is `immediate_when_idle`. `panel_buffered_bytes` counts
+  panel bytes still held for remote-command arbitration, not bytes merely being
+  observed by the frame parser.
+- `remote_stop_reason` records why the latest ESP press ended.
+- `max_serial_service_gap_ms` is the largest interval between serial-service
+  calls since boot. `free_heap_bytes` gives current free heap for diagnosing stalls
+  or resource pressure.
+- `controller_error` exposes a fresh checksum-valid `E##` display code, such as
+  `E04`, without assigning a model-dependent meaning. The page shows the code
+  rather than only `unsupported_display`. It never becomes a height reading.
+  `last_controller_error` and `last_controller_error_age_ms` retain the latest
+  code after the display returns to height, until ESP reboot.
+- `panel_wake_capture` records the first 32 received panel bytes at boot and after
+  each receive gap of at least one second. `age_ms` is time since that capture
+  began, `bytes` contains hexadecimal bytes, and `read_offsets_ms` gives each
+  byte's main-loop read time relative to the first byte. The capture survives
+  normal subsequent traffic until the next quiet-to-active transition. These are
+  observed read times, not logic-analyser measurements of wire timing.
 - `height_cm` is a number only while fresh, otherwise `null`.
 - `last_known_height_cm` retains the last decoded number until the ESP restarts.
   When `fresh` is false, the page shows this value with a `Last known height` label.
@@ -586,6 +611,21 @@ movement does not resume. Also release a web hold before its start request
 finishes, hide the page during a hold, and disconnect Wi-Fi during a hold.
 Report behavior and `/api/status`, especially `panel_uart_overruns`,
 `panel_write_failures`, `panel_invalid_frames`, and `physical_overrides`.
+
+### Sleep/wake regression
+
+The owner reported that, with the ESP adapter connected, the panel could remain
+black and unresponsive after sleep. Reconnecting just the panel restored it; a
+later physical press also showed `E04` briefly and restored normal traffic without
+rebooting the ESP. This makes panel wake/communication timing an investigation
+target; it does not establish the meaning or cause of `E04`.
+
+Idle passthrough now avoids the previous five-byte buffering delay. After
+flashing, let the panel sleep, try waking it physically, then test remote buttons.
+If it fails again, capture `/api/status` before unplugging anything, then press a
+physical button and capture it again. Include the latched controller error, wake
+capture, serial-service gap, buffered byte count, UART counters and firmware build.
+The sleep/wake hardware test is needed to establish whether this fixes the failure.
 
 ## First target-height test
 

@@ -8,6 +8,19 @@ static void frame(DeskMonitor &monitor, const uint8_t (&data)[6], uint32_t now) 
 }
 
 int main() {
+  {
+    DeskMonitor errors;
+    const uint8_t height[] = {0x5A, 0x07, 0xBF, 0x3F, 0x10, 0x15};
+    const uint8_t e04[] = {0x5A, 0x79, 0x3F, 0x66, 0x10, 0x2E};
+    frame(errors, height, 0);
+    frame(errors, e04, 10);
+    assert(!strcmp(errors.controllerError, "E04") && errors.errorFresh(10));
+    assert(errors.heightHundredths == 7000 && !errors.automaticHeightFresh(10));
+    assert(!errors.errorFresh(1010));
+    frame(errors, height, 20);
+    assert(!errors.controllerError[0] && !errors.errorFresh(20));
+    assert(!strcmp(errors.lastControllerError, "E04") && errors.lastControllerErrorMs == 10);
+  }
   const uint8_t captures[][6] = {
       {0x5A, 0x07, 0xBF, 0x3F, 0x10, 0x15},
       {0x5A, 0x07, 0x86, 0x3F, 0x10, 0xDC},
