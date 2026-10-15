@@ -77,6 +77,8 @@ class WifiConnection {
   void configure(bool saved, Network &network, uint32_t now) {
     configured = saved;
     connected = false;
+    connectionsAllowed_ = true;
+    reconnectPending_ = false;
     offlineMs_ = attemptMs_ = now;
     if (saved) network.connect(apActive);
     else {
@@ -86,13 +88,15 @@ class WifiConnection {
   }
 
   template <typename Network>
-  void update(Network &network, uint32_t now) {
+  void update(Network &network, uint32_t now, bool allowConnections = true) {
+    const bool resuming = !connectionsAllowed_ && allowConnections;
+    connectionsAllowed_ = allowConnections;
     if (!configured) { ensureAp(network, now, false); return; }
     const bool online = network.isConnected();
     if (online) {
       if (!connected) connectedMs_ = now;
       connected = true;
-      if (apActive && uint32_t(now - connectedMs_) >= apGraceMs) {
+      if (allowConnections && apActive && uint32_t(now - connectedMs_) >= apGraceMs) {
         network.stopAp();
         apActive = false;
       }
@@ -101,11 +105,13 @@ class WifiConnection {
     if (connected) {
       connected = false;
       offlineMs_ = attemptMs_ = now;
-      network.connect(apActive);
+      reconnectPending_ = true;
     }
     if (uint32_t(now - offlineMs_) >= fallbackMs) ensureAp(network, now, false);
-    if (uint32_t(now - attemptMs_) >= retryMs) {
+    if (allowConnections && (reconnectPending_ || resuming
+        || uint32_t(now - attemptMs_) >= retryMs)) {
       attemptMs_ = now;
+      reconnectPending_ = false;
       network.connect(apActive);
     }
   }
@@ -113,6 +119,7 @@ class WifiConnection {
  private:
   uint32_t offlineMs_ = 0, attemptMs_ = 0, connectedMs_ = 0, apAttemptMs_ = 0;
   bool apAttempted_ = false;
+  bool connectionsAllowed_ = true, reconnectPending_ = false;
 
   template <typename Network>
   void ensureAp(Network &network, uint32_t now, bool immediate) {

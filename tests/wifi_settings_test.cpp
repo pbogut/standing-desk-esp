@@ -1,5 +1,6 @@
 #include "wifi_settings.h"
 #include "wifi_credential_store.h"
+#include "wifi_scan.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -56,6 +57,37 @@ struct FakeNetwork {
 };
 
 int main() {
+  {
+    WifiScan scan;
+    assert(!scan.running() && scan.count == 0);
+    scan.begin(0);
+    assert(scan.running() && !scan.timedOut(14999) && scan.timedOut(15000));
+    scan.add("weak", -90, true);
+    scan.add("home", -60, true);
+    scan.add("home", -70, true);
+    scan.add("home", -40, true);
+    scan.add("open", -50, false);
+    scan.add("home", -55, false); // Do not merge open/secured versions of an SSID.
+    scan.add("", -20, true);
+    scan.add(std::string(33, 's').c_str(), -20, true);
+    assert(scan.count == 4 && !strcmp(scan.networks[0].ssid, "home"));
+    assert(scan.networks[0].rssi == -40 && scan.networks[0].secured);
+    for (unsigned i = 1; i < scan.count; ++i)
+      assert(scan.networks[i - 1].rssi >= scan.networks[i].rssi);
+    scan.complete();
+    assert(!scan.running() && !strcmp(scan.stateName(), "complete"));
+    scan.begin(UINT32_MAX - 1000);
+    assert(scan.count == 0 && !scan.timedOut(13998) && scan.timedOut(13999));
+    for (unsigned i = 0; i < 40; ++i)
+      scan.add(("network-" + std::to_string(i)).c_str(), -100 + i, true);
+    assert(scan.count == WifiScan::maxNetworks);
+    assert(scan.networks[0].rssi == -61 && scan.networks[19].rssi == -80);
+    scan.fail("Scan failed");
+    assert(scan.count == 0 && !strcmp(scan.stateName(), "failed"));
+    scan.begin(0);
+    scan.complete();
+    assert(scan.count == 0 && !strcmp(scan.stateName(), "complete"));
+  }
   {
     FakeFilesystem fs;
     WifiCredentialStore store;
@@ -191,6 +223,29 @@ int main() {
     network.failAp = false;
     wifi.update(network, 10000);
     assert(network.apStarts == 2 && wifi.apActive);
+  }
+  // Scans suspend retries and AP shutdown, then promptly resume connection work.
+  {
+    WifiConnection wifi;
+    FakeNetwork network;
+    wifi.configure(false, network, 0);
+    wifi.configure(true, network, 0);
+    wifi.update(network, 30000, false);
+    wifi.update(network, 31000, false);
+    assert(network.connections == 1 && wifi.apActive);
+    wifi.update(network, 31001);
+    assert(network.connections == 2);
+    network.online = true;
+    wifi.update(network, 32000);
+    wifi.update(network, 62000, false);
+    assert(wifi.apActive && network.apStops == 0);
+    wifi.update(network, 62001);
+    assert(!wifi.apActive && network.apStops == 1);
+    network.online = false;
+    wifi.update(network, 63000, false);
+    assert(network.connections == 2);
+    wifi.update(network, 63001);
+    assert(network.connections == 3);
   }
   // Fallback and grace periods work across millis wraparound.
   {
