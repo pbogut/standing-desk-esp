@@ -9,6 +9,7 @@
 #include "panel_bridge.h"
 #include "secrets.h"
 #include "target_move.h"
+#include "mqtt_service.h"
 #include "wifi_credential_store.h"
 #include "wifi_scan.h"
 
@@ -18,6 +19,9 @@ static_assert(sizeof(apPassword) >= 9 && sizeof(apPassword) <= 64,
 DeskMonitor desk;
 PanelBridge panel;
 TargetMove target;
+DeskMqtt mqtt(desk, panel, target);
+MqttSettings mqttSettings;
+MqttSettingsStore mqttStore;
 SoftwareSerial statusSerial;
 SoftwareSerial panelSerial;
 ESP8266WebServer server(80);
@@ -34,6 +38,8 @@ WifiChange wifiChange = WifiChange::None;
 uint32_t wifiChangeMs = 0;
 
 String wifiStatusJson();
+String mqttStatusJson();
+String jsonQuoted(const String &text);
 
 constexpr int8_t statusRxPin = D5;  // GPIO14, tap on controller -> panel status.
 constexpr int8_t panelRxPin = D6;   // GPIO12, panel side of split command wire.
@@ -621,7 +627,7 @@ void sendStatus() {
   const char *state = fresh ? "fresh" : desk.validFrames == 0 ? "waiting_for_frames"
       : !desk.displayNumeric ? "unsupported_display" : "stale";
   String json;
-  json.reserve(1792);
+  json.reserve(2560);
   json = F("{\"state\":\"");
   json += state;
   json += F("\",\"fresh\":");
@@ -677,9 +683,78 @@ void sendStatus() {
   json += F(",\"uptime_ms\":"); json += now;
   json += F(",\"passthrough_enabled\":true,\"commands_enabled\":true,\"wifi\":");
   json += wifiStatusJson();
+  json += F(",\"mqtt\":"); json += mqttStatusJson();
   json += '}';
   server.sendHeader(F("Cache-Control"), F("no-store"));
   server.send(200, F("application/json"), json);
+}
+
+String mqttStatusJson() {
+  String json;
+  json.reserve(640);
+  json = F("{\"enabled\":"); json += mqttSettings.enabled ? "true" : "false";
+  json += F(",\"storage_ready\":"); json += wifiStorageReady ? "true" : "false";
+  json += F(",\"host\":"); json += jsonQuoted(mqttSettings.host);
+  json += F(",\"port\":"); json += mqttSettings.port;
+  json += F(",\"username\":"); json += jsonQuoted(mqttSettings.username);
+  json += F(",\"topic_prefix\":"); json += jsonQuoted(mqttSettings.prefix);
+  json += F(",\"password_saved\":"); json += mqttSettings.password[0] ? "true" : "false";
+  json += F(",\"connected\":"); json += mqtt.connected() ? "true" : "false";
+  json += F(",\"state\":"); json += jsonQuoted(mqtt.stateName());
+  json += F(",\"error\":"); json += mqtt.error()[0] ? jsonQuoted(mqtt.error()) : String("null");
+  json += F(",\"command_error\":"); json += mqtt.commandError()[0] ? jsonQuoted(mqtt.commandError()) : String("null");
+  json += F(",\"commands_accepted\":"); json += mqtt.accepted();
+  json += F(",\"commands_rejected\":"); json += mqtt.rejected();
+  json += '}';
+  return json;
+}
+
+void sendMqttStatus() {
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(200, F("application/json"), mqttStatusJson());
+}
+
+template <unsigned Size>
+bool copyMqttField(const String &value, char (&out)[Size]) {
+  if (value.length() >= Size || strlen(value.c_str()) != value.length()) return false;
+  memcpy(out, value.c_str(), value.length() + 1);
+  return true;
+}
+
+void saveMqttSettings() {
+  const String enabled = server.arg("enabled"), portText = server.arg("port");
+  const String clear = server.arg("clear_password"), pass = server.arg("password");
+  MqttSettings saved;
+  uint32_t port = 0;
+  bool validPort = portText.length() > 0 && portText.length() <= 5;
+  for (unsigned i = 0; i < portText.length() && validPort; ++i) {
+    if (portText[i] < '0' || portText[i] > '9') validPort = false;
+    else port = port * 10 + portText[i] - '0';
+  }
+  saved.enabled = enabled == "true";
+  saved.port = port > 65535 ? 0 : port;
+  bool valid = (enabled == "true" || enabled == "false") && validPort
+      && (clear == "" || clear == "true" || clear == "false")
+      && server.hasArg("username") && server.hasArg("password")
+      && copyMqttField(server.arg("host"), saved.host)
+      && copyMqttField(server.arg("username"), saved.username)
+      && copyMqttField(server.arg("topic_prefix"), saved.prefix)
+      && copyMqttField(pass, saved.password);
+  if (valid && !pass.length() && saved.username[0] && clear != "true")
+    strcpy(saved.password, mqttSettings.password);
+  if (clear == "true" || !saved.username[0]) saved.password[0] = 0;
+  if (!valid || !saved.valid()) {
+    server.send(400, F("application/json"),
+        F("{\"error\":\"Invalid MQTT settings: use a host/IP, port 1..65535 and topic prefix with letters, digits, /, _, - or .\"}"));
+    return;
+  }
+  if (!wifiStorageReady || !mqttStore.save(LittleFS, saved)) {
+    server.send(500, F("application/json"), F("{\"error\":\"Could not save MQTT settings\"}"));
+    return;
+  }
+  mqttSettings = saved;
+  mqtt.configure(saved);
+  sendMqttStatus();
 }
 
 struct DeskWifiNetwork {
@@ -902,6 +977,10 @@ void setup() {
   deviceName = "standing-desk-" + String(ESP.getChipId(), HEX);
   wifiStorageReady = LittleFS.begin();
   if (wifiStorageReady) wifiStore.load(LittleFS, wifiCredentials);
+  MqttSettings loadedMqtt;
+  if (wifiStorageReady && mqttStore.load(LittleFS, loadedMqtt)) mqttSettings = loadedMqtt;
+  else snprintf(mqttSettings.prefix, sizeof(mqttSettings.prefix), "standing-desk/%x", ESP.getChipId());
+  mqtt.begin(deviceName.c_str(), mqttSettings);
   wifiConnection.configure(wifiCredentials.valid(), wifiNetwork, millis());
   server.on("/", HTTP_GET, []() {
     server.sendHeader(F("Cache-Control"), F("no-store"));
@@ -918,6 +997,8 @@ void setup() {
   server.on("/api/wifi/forget", HTTP_POST, forgetWifiSettings);
   server.on("/api/wifi/scan", HTTP_POST, startWifiScan);
   server.on("/api/wifi/scan", HTTP_GET, []() { sendWifiScan(); });
+  server.on("/api/mqtt", HTTP_GET, sendMqttStatus);
+  server.on("/api/mqtt", HTTP_POST, saveMqttSettings);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
@@ -934,5 +1015,6 @@ void loop() {
   server.handleClient();
   serviceSerial();
   serviceWifi();
+  mqtt.service(wifiConnection.connected && wifiChange == WifiChange::None, !wifiScan.running());
   yield();
 }
