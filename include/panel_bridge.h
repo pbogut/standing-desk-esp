@@ -15,6 +15,7 @@ class PanelBridge {
   uint32_t bytesReceived = 0, bytesForwarded = 0, writeFailures = 0;
   uint32_t bytesSuppressed = 0, espBytesSent = 0;
   uint32_t invalidFrames = 0, partialTimeouts = 0, physicalOverrides = 0;
+  uint32_t inputInterruptions = 0;
   uint32_t lastByteMs = 0;
   uint32_t commandId = 0;
   uint8_t commandButton = 0;
@@ -74,6 +75,7 @@ class PanelBridge {
   }
 
   void inputOverflow(uint32_t now) {
+    ++inputInterruptions;
     panelIdle_ = false;
     cancel(now, "panel_uart_overflow");
   }
@@ -99,6 +101,7 @@ class PanelBridge {
     expire(now);
     if (used_ && uint32_t(now - lastByteMs) >= frameGapMs) {
       ++partialTimeouts;
+      ++inputInterruptions;
       panelIdle_ = aligned_ = false;
       cancel(now, "partial_panel_frame");
       writeBytes(port, frame_, used_, false);
@@ -111,6 +114,7 @@ class PanelBridge {
       ++bytesReceived;
       lastByteMs = now;
       if (!used_ && byte != 0xA5) {
+        ++inputInterruptions;
         panelIdle_ = aligned_ = false;
         cancel(now, "invalid_panel_frame");
         const uint8_t raw = static_cast<uint8_t>(byte);
@@ -192,6 +196,7 @@ class PanelBridge {
     const uint8_t sum = frame_[1] + frame_[2] + frame_[3];
     if (sum != frame_[4]) {
       ++invalidFrames;
+      ++inputInterruptions;
       panelIdle_ = aligned_ = false;
       cancel(now, "invalid_panel_frame");
       // Forward corrupt bytes unchanged, retaining an embedded candidate header.
@@ -206,6 +211,7 @@ class PanelBridge {
     lastFrameMs_ = now;
     panelIdle_ = frame_[1] == 0 && frame_[2] == 0 && frame_[3] == 0;
     if (!panelIdle_) {
+      ++inputInterruptions;
       if (commandButton) ++physicalOverrides;
       cancel(now, "panel_override");
       // A release before takeover makes even the same preset a new press.
