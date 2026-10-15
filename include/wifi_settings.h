@@ -73,6 +73,10 @@ class WifiConnection {
     return elapsed < fallbackMs ? fallbackMs - elapsed : 0;
   }
 
+  void extendApGrace(uint32_t now) {
+    if (connected && apActive) connectedMs_ = now;
+  }
+
   template <typename Network>
   void configure(bool saved, Network &network, uint32_t now) {
     configured = saved;

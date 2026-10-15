@@ -10,6 +10,7 @@
 #include "secrets.h"
 #include "target_move.h"
 #include "wifi_credential_store.h"
+#include "wifi_scan.h"
 
 static_assert(sizeof(apPassword) >= 9 && sizeof(apPassword) <= 64,
               "AP password must contain 8 to 63 characters");
@@ -24,6 +25,8 @@ uint32_t uartOverruns = 0, panelUartOverruns = 0;
 WifiCredentials wifiCredentials;
 WifiCredentialStore wifiStore;
 WifiConnection wifiConnection;
+WifiScan wifiScan;
+bool wifiScanCleanupPending = false;
 String deviceName;
 bool wifiStorageReady = false, mdnsRunning = false;
 enum class WifiChange { None, Connect, Forget };
@@ -660,6 +663,7 @@ String wifiStatusJson() {
   json += jsonQuoted(wifiConnection.apActive ? WiFi.softAPIP().toString() : String(""));
   json += F(",\"fallback_remaining_ms\":"); json += wifiConnection.fallbackRemaining(millis());
   json += F(",\"ap_grace_ms\":"); json += WifiConnection::apGraceMs;
+  json += F(",\"scan_state\":"); json += jsonQuoted(wifiScan.stateName());
   json += '}';
   return json;
 }
@@ -669,7 +673,86 @@ void sendWifiStatus() {
   server.send(200, F("application/json"), wifiStatusJson());
 }
 
+void finishWifiScan() {
+  WiFi.setAutoReconnect(true);
+  if (!wifiConnection.configured && !wifiScanCleanupPending) WiFi.mode(WIFI_AP);
+  wifiConnection.extendApGrace(millis());
+  wifiConnection.update(wifiNetwork, millis());
+}
+
+void serviceWifiScan() {
+  if (wifiScanCleanupPending && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+    WiFi.scanDelete();
+    wifiScanCleanupPending = false;
+    if (!wifiConnection.configured) WiFi.mode(WIFI_AP);
+  }
+  if (!wifiScan.running()) return;
+  const int result = WiFi.scanComplete();
+  if (result == WIFI_SCAN_RUNNING) {
+    if (!wifiScan.timedOut(millis())) return;
+    wifiScan.fail("Scan timed out");
+    wifiScanCleanupPending = true;
+  } else if (result < 0) {
+    wifiScan.fail("Wi-Fi scan failed");
+    WiFi.scanDelete();
+  } else {
+    for (int i = 0; i < result; ++i) {
+      const String ssid = WiFi.SSID(i);
+      if (ssid.length() == strlen(ssid.c_str()))
+        wifiScan.add(ssid.c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) != ENC_TYPE_NONE);
+    }
+    wifiScan.complete();
+    WiFi.scanDelete();
+  }
+  finishWifiScan();
+}
+
+void sendWifiScan(int code = 200) {
+  String json;
+  json.reserve(128 + wifiScan.count * 90);
+  json = F("{\"state\":"); json += jsonQuoted(wifiScan.stateName());
+  json += F(",\"error\":"); json += wifiScan.error[0] ? jsonQuoted(wifiScan.error) : String("null");
+  json += F(",\"networks\":[");
+  for (unsigned i = 0; i < wifiScan.count; ++i) {
+    const WifiScan::Network &network = wifiScan.networks[i];
+    if (i) json += ',';
+    json += F("{\"ssid\":"); json += jsonQuoted(network.ssid);
+    json += F(",\"rssi\":"); json += String(network.rssi);
+    json += F(",\"secured\":"); json += network.secured ? "true" : "false";
+    json += '}';
+  }
+  json += F("]}");
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(code, F("application/json"), json);
+}
+
+void startWifiScan() {
+  if (wifiScan.running()) { sendWifiScan(202); return; }
+  if (wifiChange != WifiChange::None || WiFi.scanComplete() == WIFI_SCAN_RUNNING
+      || (wifiConnection.configured && !wifiConnection.connected && !wifiConnection.apActive)) {
+    server.send(409, F("application/json"), F("{\"error\":\"Wi-Fi is busy connecting or scanning; try again shortly\"}"));
+    return;
+  }
+  // The SDK scanner enables STA while preserving an existing AP. Prevent its
+  // reconnect machinery and our retry timer from competing with the scan.
+  wifiConnection.update(wifiNetwork, millis(), false);
+  WiFi.setAutoReconnect(false);
+  wifiScanCleanupPending = false;
+  wifiScan.begin(millis());
+  if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED) {
+    wifiScan.fail("Could not start Wi-Fi scan");
+    finishWifiScan();
+    sendWifiScan(500);
+    return;
+  }
+  sendWifiScan(202);
+}
+
 void saveWifiSettings() {
+  if (wifiScan.running()) {
+    server.send(409, F("application/json"), F("{\"error\":\"Wait for the Wi-Fi scan to finish\"}"));
+    return;
+  }
   const String ssid = server.arg("ssid"), password = server.arg("password");
   WifiCredentials saved;
   if (!server.hasArg("ssid") || !server.hasArg("password")
@@ -690,6 +773,10 @@ void saveWifiSettings() {
 }
 
 void forgetWifiSettings() {
+  if (wifiScan.running()) {
+    server.send(409, F("application/json"), F("{\"error\":\"Wait for the Wi-Fi scan to finish\"}"));
+    return;
+  }
   if (!wifiStorageReady || !wifiStore.forget(LittleFS)) {
     server.send(500, F("application/json"), F("{\"error\":\"Could not remove Wi-Fi settings\"}"));
     return;
@@ -702,6 +789,7 @@ void forgetWifiSettings() {
 
 void serviceWifi() {
   const uint32_t now = millis();
+  serviceWifiScan();
   if (wifiChange != WifiChange::None) {
     // Let the HTTP reply leave before changing its network interface.
     if (uint32_t(now - wifiChangeMs) < 500) return;
@@ -709,7 +797,7 @@ void serviceWifi() {
     wifiConnection.configure(wifiChange == WifiChange::Connect, wifiNetwork, now);
     wifiChange = WifiChange::None;
   }
-  wifiConnection.update(wifiNetwork, now);
+  wifiConnection.update(wifiNetwork, now, !wifiScan.running());
   if (wifiConnection.connected && !mdnsRunning) {
     mdnsRunning = MDNS.begin(deviceName.c_str());
     if (mdnsRunning) MDNS.addService("http", "tcp", 80);
@@ -747,6 +835,8 @@ void setup() {
   server.on("/api/wifi", HTTP_GET, sendWifiStatus);
   server.on("/api/wifi", HTTP_POST, saveWifiSettings);
   server.on("/api/wifi/forget", HTTP_POST, forgetWifiSettings);
+  server.on("/api/wifi/scan", HTTP_POST, startWifiScan);
+  server.on("/api/wifi/scan", HTTP_GET, []() { sendWifiScan(); });
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
