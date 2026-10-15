@@ -99,6 +99,28 @@ Saving replaces the previous settings; the saved password is never shown.</p>
 </form>
 <p id="wifi-message" role="status"></p>
 </details>
+<details><summary>MQTT / Home Assistant</summary>
+<p id="mqtt-state" role="status">Loading MQTT status...</p>
+<form id="mqtt-form">
+<p><label><input id="mqtt-enabled" type="checkbox" disabled> Enable MQTT</label></p>
+<p><label for="mqtt-host">Broker IP or hostname</label><br>
+<input id="mqtt-host" maxlength="64" placeholder="192.168.1.50" disabled></p>
+<p><label for="mqtt-port">Port</label><br>
+<input id="mqtt-port" type="number" min="1" max="65535" value="1883" required disabled></p>
+<p><label for="mqtt-user">Username</label><br>
+<input id="mqtt-user" maxlength="64" autocomplete="off" disabled></p>
+<p><label for="mqtt-password">Password</label><br>
+<input id="mqtt-password" type="password" maxlength="128" autocomplete="off" disabled></p>
+<p id="mqtt-password-help"></p>
+<p><label><input id="mqtt-clear-password" type="checkbox" disabled> Clear saved password</label></p>
+<p><label for="mqtt-prefix">Topic prefix</label><br>
+<input id="mqtt-prefix" maxlength="96" required disabled></p>
+<p>Plain MQTT TCP, usually port 1883. Home Assistant discovery is automatic.
+Use letters, digits, /, _, - or . in the prefix, for example home/office/desk.</p>
+<button id="mqtt-save" type="submit" disabled>Save and connect</button>
+</form>
+<p id="mqtt-message" role="status"></p>
+</details>
 <details open><summary>UART diagnostics</summary><pre id="diagnostics"></pre></details>
 <script>
 const height=document.getElementById('height');
@@ -124,12 +146,48 @@ const wifiMessage=document.getElementById('wifi-message');
 const wifiScanButton=document.getElementById('wifi-scan');
 const wifiScanState=document.getElementById('wifi-scan-state');
 const wifiNetworks=document.getElementById('wifi-networks');
+const mqttForm=document.getElementById('mqtt-form');
+const mqttState=document.getElementById('mqtt-state');
+const mqttMessage=document.getElementById('mqtt-message');
+const mqttPasswordHelp=document.getElementById('mqtt-password-help');
+const mqttSave=document.getElementById('mqtt-save');
+const mqttFields={enabled:document.getElementById('mqtt-enabled'),host:document.getElementById('mqtt-host'),
+  port:document.getElementById('mqtt-port'),user:document.getElementById('mqtt-user'),
+  password:document.getElementById('mqtt-password'),clear:document.getElementById('mqtt-clear-password'),
+  prefix:document.getElementById('mqtt-prefix')};
 const presetButtons=[...document.querySelectorAll('[data-preset]')];
 const moveButtons=[...document.querySelectorAll('[data-direction]')];
 let available=false, presetPending=false, hold=null, remoteId=null;
 let targetReady=false, targetActive=false, targetId=null, targetRequest=null;
 let wifiReady=false, wifiSaved=false, wifiEdited=false, wifiPending=false;
 let wifiScanning=false, wifiCanScan=false, wifiNetworkCount=0, wifiScanTimer=null;
+let mqttEdited=false, mqttPending=false, mqttReady=false;
+function updateMqttControls(){
+  for(const field of Object.values(mqttFields))field.disabled=mqttPending || !mqttReady;
+  mqttSave.disabled=mqttPending || !mqttReady;
+  mqttFields.host.required=mqttFields.enabled.checked;
+}
+function showMqtt(data){
+  mqttReady=data.storage_ready;
+  if(!mqttEdited){
+    mqttFields.enabled.checked=data.enabled;
+    mqttFields.host.value=data.host;
+    mqttFields.port.value=String(data.port);
+    mqttFields.user.value=data.username;
+    mqttFields.prefix.value=data.topic_prefix;
+  }
+  mqttPasswordHelp.textContent=data.password_saved
+    ? 'A password is saved. Leave blank to keep it, or select Clear saved password.'
+    : 'No password saved. Leave username and password blank for an anonymous broker.';
+  mqttState.textContent='MQTT: '+data.state.replaceAll('_',' ')
+    +(data.error ? '. '+data.error.replaceAll('_',' ') : '')
+    +(data.command_error ? '. Last command: '+data.command_error : '');
+  updateMqttControls();
+}
+for(const field of Object.values(mqttFields)){
+  field.addEventListener('input',()=>{mqttEdited=true;updateMqttControls();});
+  field.addEventListener('change',()=>{mqttEdited=true;updateMqttControls();});
+}
 function updateWifiControls(){
   wifiSsid.disabled=wifiPassword.disabled=wifiPending || !wifiReady;
   wifiSave.disabled=wifiPending || wifiScanning || !wifiReady;
@@ -249,6 +307,23 @@ async function command(path, args){
     return data;
   }finally{clearTimeout(timeout);}
 }
+mqttForm.addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(mqttPending || !mqttReady)return;
+  mqttPending=true;
+  updateMqttControls();
+  try{
+    const data=await command('mqtt',{enabled:String(mqttFields.enabled.checked),host:mqttFields.host.value,
+      port:mqttFields.port.value,username:mqttFields.user.value,password:mqttFields.password.value,
+      clear_password:String(mqttFields.clear.checked),topic_prefix:mqttFields.prefix.value});
+    mqttEdited=false;
+    mqttFields.password.value='';
+    mqttFields.clear.checked=false;
+    showMqtt(data);
+    mqttMessage.textContent='MQTT settings saved. Check the connection status above.';
+  }catch(error){mqttMessage.textContent='Could not save MQTT settings: '+error.message;}
+  finally{mqttPending=false;updateMqttControls();}
+});
 wifiForm.addEventListener('submit',async event=>{
   event.preventDefault();
   if(wifiPending || wifiScanning || !wifiReady)return;
@@ -397,6 +472,7 @@ async function poll(){
     panel.textContent=data.panel_fresh ? 'Panel traffic received' : 'No recent panel traffic';
     diagnostics.textContent=JSON.stringify(data,null,2);
     if(data.wifi)showWifi(data.wifi);
+    if(data.mqtt)showMqtt(data.mqtt);
     available=data.remote_ready;
     targetReady=data.target_ready;
     targetActive=data.target_active;
@@ -428,6 +504,9 @@ async function poll(){
     wifiAddress.hidden=true;
     wifiState.textContent='Monitor unreachable. Rejoin home Wi-Fi or the backup network.';
     updateWifiControls();
+    mqttReady=false;
+    mqttState.textContent='MQTT status unavailable: monitor unreachable';
+    updateMqttControls();
     updateControls();
   }finally{
     clearTimeout(timeout);

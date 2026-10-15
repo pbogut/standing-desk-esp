@@ -9,7 +9,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function element(dataset = {}) {
   return {
-    dataset, textContent: '', value: '', disabled: true, listeners: {}, children: [],
+    dataset, textContent: '', value: '', checked: false, disabled: true, listeners: {}, children: [],
     replaceChildren(...nodes) { this.children = nodes; },
     appendChild(node) { this.children.push(node); return node; },
     addEventListener(name, callback) { this.listeners[name] = callback; },
@@ -27,7 +27,9 @@ async function page() {
      'target-form', 'target-height', 'target-submit', 'target-cancel', 'target-state']
       .concat(['wifi-form', 'wifi-ssid', 'wifi-password', 'wifi-save', 'wifi-forget',
                'wifi-state', 'wifi-address', 'wifi-message', 'wifi-scan', 'wifi-scan-state',
-               'wifi-networks'])
+               'wifi-networks', 'mqtt-form', 'mqtt-state', 'mqtt-message', 'mqtt-password-help',
+               'mqtt-save', 'mqtt-enabled', 'mqtt-host', 'mqtt-port', 'mqtt-user', 'mqtt-password',
+               'mqtt-clear-password', 'mqtt-prefix'])
       .map(id => [id, element()]));
   elements['control-ready'].textContent = 'Connecting controls...';
   const presets = [1, 2, 3].map(number => element({preset: String(number)}));
@@ -48,7 +50,9 @@ async function page() {
       remote_button: 'idle', remote_command_id: 0, target_ready: false,
       target_active: false, target_command_id: 0, target_state: 'idle', target_reason: 'idle',
       wifi: {storage_ready: true, configured: false, ssid: '', connected: false,
-        state: 'setup_ap', ap_active: true, ap_ssid: 'standing-desk-test', ap_ip: '192.168.4.1'}}
+        state: 'setup_ap', ap_active: true, ap_ssid: 'standing-desk-test', ap_ip: '192.168.4.1'},
+      mqtt: {enabled:false,storage_ready:true,host:'',port:1883,username:'',password_saved:false,
+        topic_prefix:'standing-desk/test',state:'disabled',error:null,command_error:null}}
   };
   const context = vm.createContext({
     document, window, AbortController, URLSearchParams,
@@ -68,6 +72,9 @@ async function page() {
       const args = Object.fromEntries(options.body);
       client.requests.push({url, args, options});
       if (client.responses.length) return client.responses.shift()(url, args);
+      if(url === '/api/mqtt')return {ok:true,json:async()=>({...client.status.mqtt,
+        enabled:args.enabled==='true',host:args.host,port:Number(args.port),username:args.username,
+        topic_prefix:args.topic_prefix,password_saved:args.password.length>0,state:'applying'})};
       if(url === '/api/wifi/scan')return {ok:true,
         json:async()=>({state:'running',error:null,networks:[]})};
       if(url === '/api/wifi' || url === '/api/wifi/forget')return {ok: true,
@@ -429,6 +436,40 @@ async function page() {
     assert.match(client.elements['wifi-scan-state'].textContent,/Scan connection lost/);
     assert(!client.elements['wifi-scan'].disabled);
     assert(!client.elements['wifi-save'].disabled);
+  }
+  {
+    const client=await page();
+    assert.equal(client.elements['mqtt-port'].value,'1883');
+    assert.equal(client.elements['mqtt-prefix'].value,'standing-desk/test');
+    client.elements['mqtt-enabled'].checked=true;
+    client.elements['mqtt-enabled'].fire('change');
+    client.elements['mqtt-host'].value='192.168.1.50';
+    client.elements['mqtt-user'].value='desk';
+    client.elements['mqtt-password'].value='mqtt-test-password';
+    client.elements['mqtt-prefix'].value='home/office/desk';
+    await client.poll();
+    assert.equal(client.elements['mqtt-host'].value,'192.168.1.50');
+    await client.elements['mqtt-form'].fire('submit');
+    assert.equal(client.requests[0].url,'/api/mqtt');
+    assert.deepEqual(client.requests[0].args,{enabled:'true',host:'192.168.1.50',port:'1883',
+      username:'desk',password:'mqtt-test-password',clear_password:'false',topic_prefix:'home/office/desk'});
+    assert.equal(client.elements['mqtt-password'].value,'');
+    assert.match(client.elements['mqtt-password-help'].textContent,/Leave blank to keep/);
+    Object.assign(client.status.mqtt,{state:'retry_wait',error:'not_authorized'});
+    await client.poll();
+    assert.match(client.elements['mqtt-state'].textContent,/not authorized/);
+  }
+  {
+    const client=await page();
+    client.elements['mqtt-password'].value='keep-for-correction';
+    client.responses.push(async()=>({ok:false,json:async()=>({error:'Storage failed'})}));
+    await client.elements['mqtt-form'].fire('submit');
+    assert.match(client.elements['mqtt-message'].textContent,/Storage failed/);
+    assert.equal(client.elements['mqtt-password'].value,'keep-for-correction');
+    assert(!client.elements['mqtt-save'].disabled);
+    client.offline=true;
+    await client.poll();
+    assert(client.elements['mqtt-save'].disabled);
   }
   console.log('All web controls tests passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

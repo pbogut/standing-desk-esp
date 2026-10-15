@@ -22,11 +22,19 @@ for the current API, timing, diagnostics, and test instructions.
 Wi-Fi credentials can now be entered on the web page and persist in LittleFS.
 With saved settings, the ESP tries home Wi-Fi and starts its backup AP after
 60 seconds offline. The AP stays available during setup and closes after a
-30-second stable home connection. Wi-Fi setup and fallback still need a physical
-test. Connection attempts are non-blocking so the panel bridge remains serviced.
+30-second stable home connection. Fallback recovery still needs a physical test.
+Connection attempts are non-blocking so the panel bridge remains serviced.
 The Wi-Fi settings page also scans asynchronously for nearby 2.4 GHz networks,
 shows signal/security information, and fills the SSID from a selectable list.
 Scanning pauses retries and AP shutdown, and leaves saved credentials unchanged.
+The owner verified Wi-Fi scanning and home-network connection on hardware.
+MQTT settings are now available on the web page, including broker, login, port,
+and topic prefix. The asynchronous client publishes Home Assistant discovery,
+height/freshness, target state and availability, and accepts presets, short manual
+steps, targets and target cancellation. Retained/duplicate command deliveries are
+rejected and physical input retains priority. MQTT and discovery need a live test
+against the owner's Mosquitto/Home Assistant server. Target moves have a reported
+roughly 0.7 cm physical overshoot; fine positioning has not been implemented.
 The replacement-panel proposal and stages below are the original handoff; their
 wiring and keypad-absence tests do not describe the current inline adapter.
 

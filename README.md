@@ -221,6 +221,104 @@ network. Invalid fields return HTTP 400; storage failures return HTTP 500 and
 leave the previous settings in use. **Forget network** is also available on the
 web page. After using it from home Wi-Fi, reconnect to the setup AP.
 
+## MQTT and Home Assistant
+
+The desk connects to your existing MQTT broker using plain MQTT TCP, normally on
+port **1883**. TLS is not included. In the web page, expand **MQTT / Home
+Assistant**, enable MQTT, enter the broker's LAN IPv4 address or hostname and
+port, and add your broker username/password if required. Choose **Save and
+connect**. MQTT starts disabled on a new installation.
+
+The **Topic prefix** defaults to `standing-desk/<chip-id>` and is editable, for
+example `home/office/desk`. It accepts letters, digits, `/`, `_`, `-`, and `.`,
+without leading/trailing slashes or empty path segments. It must be unique to
+this desk. Hostnames/IPs must not include `mqtt://` or a port suffix.
+
+Settings persist in a separate checksummed LittleFS record. Passwords are never
+returned by the API or logged. Leave the password field blank to keep its saved
+value, or select **Clear saved password** to remove it. Clearing the username
+also clears the password for anonymous access. Unlike the Wi-Fi form, an empty
+MQTT password does not overwrite an existing saved password by itself.
+
+Once connected, Home Assistant MQTT discovery creates one **Standing desk**
+device with these entities:
+
+| Entity | Behavior |
+|---|---|
+| Height | Last clean height received since this ESP boot, in centimetres |
+| Height fresh | Whether a fresh, supported height is currently being received |
+| Preset 1 / 2 / 3 | A 100 ms preset-button press |
+| Up / Down | A short manual press, expiring after 300 ms |
+| Target height | A whole-centimetre target between 68 and 120 |
+| Cancel automatic move | Release an ESP target-height move |
+| Automatic move status | Target state, with reason and other state fields as attributes |
+
+Availability is attached to all entities using an `online`/`offline` topic and a
+retained MQTT last will. Discovery uses stable chip-based unique IDs under
+`homeassistant/.../config`. Configurations are republished on broker connection
+and when Home Assistant publishes `online` to `homeassistant/status`. Changing
+the desk's topic prefix updates the same discovery entities on that broker.
+
+The broker account needs publish permission for the desk prefix and its
+`homeassistant/.../config` topics, plus subscribe permission for the desk's
+commands and `homeassistant/status`. Home Assistant's MQTT integration must be
+connected to that broker with discovery enabled.
+
+With prefix `home/office/desk`:
+
+| Topic | Payload / purpose | Retained |
+|---|---|---|
+| `home/office/desk/state` | JSON height, freshness, target, button and command-result fields | Yes |
+| `home/office/desk/availability` | `online` / `offline` | Yes |
+| `home/office/desk/command/preset` | `1`, `2`, or `3` | **No** |
+| `home/office/desk/command/move` | `up` or `down`, one short press | **No** |
+| `home/office/desk/command/target` | Whole centimetres, such as `95` or `95.0` | **No** |
+| `home/office/desk/command/cancel` | `cancel`, for the current automatic target | **No** |
+
+Command subscriptions use QoS 0 and a clean session. Deliveries marked retained
+or duplicate are rejected; commands must be published without retain. Callbacks
+only validate/copy a bounded payload into a single pending-command slot. The
+main loop applies it through the same panel/target controller used by HTTP.
+Queued commands expire after 250 ms, and any physical press or new panel-input
+error after arrival invalidates them. A cancel request can replace a pending
+target request; other commands are not queued behind an existing request.
+
+Manual commands work while the panel sleeps. Targets require fresh clean height
+and the existing panel checks. Physical panel presses retain priority and cancel
+remote movement. The cancel button ends an ESP target move, not autonomous
+preset travel. Target positioning currently overshoots by about 0.7 cm in the
+owner's hardware tests; measured height and requested target are separate values.
+
+Broker connection, subscription, and publish acknowledgements have ten-second
+timeouts, with connection retries after five seconds. Publications use QoS 1 and
+retain, with at most one unacknowledged publication so a slow broker cannot grow
+an unbounded state/discovery queue. State changes are sampled every 250 ms, with
+prompt updates after commands and a periodic retained refresh. New broker
+connection attempts pause during a Wi-Fi scan. Existing MQTT connections can
+continue while scanning.
+
+Disconnect/reconfiguration clears pending MQTT commands and releases an active
+MQTT-owned manual press. An accepted target move remains managed locally by the
+ESP, including display/progress/time-limit cancellation. No commands are replayed
+when the broker reconnects, and no movement resumes after reboot.
+
+`GET /api/mqtt` returns settings without the password, connection state/error,
+last command error, and accepted/rejected counters. `/api/status` contains the
+same information in its `mqtt` object. `POST /api/mqtt` saves form fields `enabled`
+as `true`/`false`, `host`, `port`, `username`, `password`, `topic_prefix`, and the
+optional `clear_password` as `true`/`false`. Invalid settings return HTTP 400;
+storage failures return HTTP 500 and preserve the previous settings. Disabling
+MQTT keeps its settings for later use.
+
+Connection states include `disabled`, `waiting_wifi`, `connecting`, `initializing`,
+`connected`, `retry_wait`, and `applying`. Authentication failures report
+`bad_credentials` or `not_authorized`; unreachable brokers can report
+`connect_timeout` or `broker_unreachable_or_disconnected`. `dns_failed` indicates
+a hostname lookup failure. `subscription_denied` and `publish_timeout` help
+diagnose broker permissions or missing acknowledgements.
+Command failures are reported separately in `command_error` and the retained
+state message. A rejected target request does not move the desk.
+
 ## Diagnostics
 
 The page polls `GET /api/status` twice per second. The endpoint also works directly:
@@ -413,6 +511,20 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
   tests/wifi_settings_test.cpp -o .pio/wifi_settings_test
 .pio/wifi_settings_test
 python3 tests/wifi_api_test.py
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Iinclude \
+  tests/mqtt_settings_test.cpp -o .pio/mqtt_settings_test
+.pio/mqtt_settings_test
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Iinclude \
+  tests/mqtt_commands_test.cpp -o .pio/mqtt_commands_test
+.pio/mqtt_commands_test
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -Itests/support -Iinclude \
+  tests/mqtt_service_test.cpp src/mqtt_service.cpp -o .pio/mqtt_service_test
+.pio/mqtt_service_test
+python3 tests/mqtt_discovery_test.py
+python3 tests/mqtt_api_test.py
 ```
 
 Tests cover all seven captured examples, checksum rejection, invalid display
@@ -435,6 +547,10 @@ deferred network changes, and settings-page interactions.
 Scan tests also cover sorted/deduplicated/bounded results, hidden SSID omission,
 async SDK calls, overlapping requests, errors/timeouts, retry coordination,
 AP grace periods, safe network selection, and scan polling/recovery.
+MQTT tests cover settings persistence/failure recovery, secret omission, topic and
+payload validation, retained/duplicate/expired commands, physical-input priority,
+fragment assembly, discovery JSON, reconnects, authentication errors, bounded
+publishing, manual-step expiry, target/cancel behavior, and web settings.
 
 ## First desk test
 
@@ -494,3 +610,18 @@ and remaining fallback time.
 Also check **Scan networks**, select a nearby SSID, and confirm that its name is
 filled in without changing the password or saving automatically. Verify that the
 physical panel and diagnostics still work while the scan is running.
+
+## First MQTT / Home Assistant test
+
+Enter the Mosquitto LAN IP, port and login on the desk's web page and enable MQTT.
+Confirm `connected`, then look for **Standing desk** in Home Assistant under
+**Settings > Devices & services > MQTT**. Check height and freshness, a brief
+Up/Down step, presets, and physical-panel override. A target request should be
+refused while the panel is asleep or showing an unsupported display. Check cancel
+during a nearby target move and report any positioning overshoot.
+
+Restart the broker and Home Assistant separately. Confirm the device returns,
+discovery/state recover, and no old command executes. Power-cycle the ESP to
+check saved MQTT settings. Report `/api/mqtt` and `/api/status` for errors.
+Broker connectivity, discovery in your Home Assistant version, and live serial
+timing still require this hardware test; host tests use a controlled MQTT transport.
