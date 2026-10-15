@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <IPAddress.h>
 
 enum class AsyncMqttClientDisconnectReason : uint8_t { TCP_DISCONNECTED=0, MQTT_NOT_AUTHORIZED=5 };
 struct AsyncMqttClientMessageProperties { uint8_t qos; bool dup, retain; };
@@ -24,6 +25,7 @@ class AsyncMqttClient {
   AsyncMqttClient() { instance=this; }
   AsyncMqttClient &setClientId(const char *value) { id=value; return *this; }
   AsyncMqttClient &setServer(const char *value,uint16_t number) { host=value;port=number;return *this; }
+  AsyncMqttClient &setServer(IPAddress value,uint16_t number) { host=value.toString();port=number;return *this; }
   AsyncMqttClient &setCleanSession(bool value) { cleanSession=value;return *this; }
   AsyncMqttClient &setKeepAlive(uint16_t) { return *this; }
   AsyncMqttClient &setMaxTopicLength(uint16_t) { return *this; }

@@ -30,11 +30,34 @@ void DeskMqtt::setupClient() {
   snprintf(stateTopic_, sizeof(stateTopic_), "%s/state", live_.prefix);
   snprintf(availabilityTopic_, sizeof(availabilityTopic_), "%s/availability", live_.prefix);
   snprintf(commandTopic_, sizeof(commandTopic_), "%s/command/+", live_.prefix);
-  client_.setClientId(id_).setServer(live_.host, live_.port).setCleanSession(true)
+  client_.setClientId(id_).setCleanSession(true)
       .setKeepAlive(15).setMaxTopicLength(160)
       .setCredentials(live_.username[0] ? live_.username : nullptr,
                       live_.username[0] ? live_.password : nullptr)
       .setWill(availabilityTopic_, 1, true, "offline");
+}
+
+void DeskMqtt::dnsResult(const char *, const ip_addr_t *address, void *argument) {
+  DeskMqtt &self = *static_cast<DeskMqtt *>(argument);
+  self.dnsPending_ = false;
+  if (self.dnsGeneration_ != self.generation_) return;
+  self.dnsFailed_ = address == nullptr;
+  self.dnsReady_ = address != nullptr;
+  if (address) self.resolvedAddress_ = *address;
+}
+
+bool DeskMqtt::resolveAddress() {
+  IPAddress numeric;
+  if (numeric.fromString(live_.host)) { resolvedAddress_ = numeric; return true; }
+  if (dnsReady_) return true;
+  if (dnsPending_) return false;
+  dnsGeneration_ = generation_;
+  dnsPending_ = true;
+  ip_addr_t address;
+  const err_t result = dns_gethostbyname(live_.host, &address, dnsResult, this);
+  if (result == ERR_OK) dnsResult(live_.host, &address, this);
+  else if (result != ERR_INPROGRESS) dnsResult(live_.host, nullptr, this);
+  return dnsReady_;
 }
 
 void DeskMqtt::configure(const MqttSettings &settings) {
@@ -65,6 +88,8 @@ void DeskMqtt::reset(uint32_t now) {
   subscribeFailed_ = false;
   waitingPacket_ = 0;
   purpose_ = Purpose::None;
+  ++generation_;
+  tcpStarted_ = dnsReady_ = dnsFailed_ = false;
   attempted_ = true;
   lastAttemptMs_ = now;
 }
@@ -170,13 +195,22 @@ void DeskMqtt::service(bool networkReady, bool allowConnect) {
     if (!commandSubscription_ || !birthSubscription_) { fail("subscribe_failed", now); return; }
   }
   if (!client_.connected()) {
-    if (connecting_) {
-      if (uint32_t(now - stageMs_) >= 10000) fail("connect_timeout", now);
-    } else if (allowConnect && (!attempted_ || uint32_t(now - lastAttemptMs_) >= 5000)) {
+    if (!connecting_ && allowConnect && (!attempted_ || uint32_t(now - lastAttemptMs_) >= 5000)) {
       attempted_ = connecting_ = true;
+      tcpStarted_ = dnsReady_ = dnsFailed_ = false;
       lastAttemptMs_ = stageMs_ = now;
       client_.clearQueue();
-      client_.connect();
+    }
+    if (connecting_) {
+      if (uint32_t(now - stageMs_) >= 10000) fail("connect_timeout", now);
+      else if (dnsFailed_) fail("dns_failed", now);
+      else if (!tcpStarted_ && resolveAddress()) {
+        // Resolve outside AsyncTCP so a late lookup from an old configuration
+        // cannot open a connection using newly saved credentials.
+        client_.setServer(resolvedAddress_, live_.port);
+        tcpStarted_ = true;
+        client_.connect();
+      }
     }
     return;
   }

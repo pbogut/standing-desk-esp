@@ -4,6 +4,16 @@
 uint32_t now=0;
 uint32_t millis() { return now; }
 AsyncMqttClient *AsyncMqttClient::instance=nullptr;
+dns_found_callback dnsCallback=nullptr;
+void *dnsArgument=nullptr;
+unsigned dnsCalls=0;
+err_t dns_gethostbyname(const char *,ip_addr_t *,dns_found_callback callback,void *argument) {
+  ++dnsCalls;dnsCallback=callback;dnsArgument=argument;return ERR_INPROGRESS;
+}
+static void resolveDns(uint32_t address) {
+  const ip_addr_t result={address};
+  dnsCallback("test",&result,dnsArgument);
+}
 
 struct Fixture {
   DeskMonitor desk;
@@ -12,10 +22,10 @@ struct Fixture {
   DeskMqtt mqtt;
   MqttSettings settings;
   AsyncMqttClient &client;
-  Fixture() : mqtt(desk,panel,target), client(*AsyncMqttClient::instance) {
+  Fixture(const char *host="192.168.1.50") : mqtt(desk,panel,target), client(*AsyncMqttClient::instance) {
     now=0;
     settings.enabled=true;
-    strcpy(settings.host,"192.168.1.50");
+    strcpy(settings.host,host);
     strcpy(settings.username,"desk");strcpy(settings.password,"test-password");
     strcpy(settings.prefix,"home/office/desk");
     mqtt.begin("standing-desk-abc123",settings);
@@ -100,6 +110,32 @@ int main() {
     assert(!strcmp(f.mqtt.error(),"not_authorized"));
   }
   {
+    Fixture f;
+    const uint8_t height[]={0x5A,0x07,0xBF,0x3F,0x10,0x15};
+    for(uint8_t byte:height)f.desk.feed(byte,now);
+    struct IdlePort {
+      unsigned position=0;
+      int available() const { return 5-position; }
+      int read() { return position++==0?0xA5:0; }
+      unsigned write(uint8_t) { return 1; }
+    } port;
+    f.panel.forward(port,now);
+    f.connect();
+    f.client.message("home/office/desk/command/target","95");
+    f.mqtt.service(true);
+    assert(f.target.active() && f.panel.commandButton==0x20);
+    f.client.message("home/office/desk/command/cancel","cancel");
+    f.mqtt.service(true);
+    assert(!f.target.active() && f.panel.commandButton==0);
+    f.drain();
+    now=1000;f.mqtt.service(true);f.drain();
+    assert(f.client.publications.back().payload.find("\"height_cm\":70.00")!=std::string::npos);
+    assert(f.client.publications.back().payload.find("\"height_fresh\":false")!=std::string::npos);
+    f.client.message("home/office/desk/command/target","95");
+    f.mqtt.service(true);
+    assert(!f.target.active() && f.mqtt.rejected()==1);
+  }
+  {
     Fixture f;f.mqtt.service(true);now=10000;f.mqtt.service(true);
     assert(!strcmp(f.mqtt.error(),"connect_timeout"));
   }
@@ -111,6 +147,20 @@ int main() {
     assert(!strcmp(f.mqtt.stateName(),"disabled") && !f.mqtt.connected());
     f.client.message("home/office/desk/command/move","up");
     f.mqtt.service(true);assert(f.panel.commandButton==0);
+  }
+  {
+    dnsCalls=0;
+    Fixture f("oldbox.lan");f.mqtt.service(true);
+    assert(dnsCalls==1 && f.client.connections==0);
+    strcpy(f.settings.host,"newbox.lan");
+    f.mqtt.configure(f.settings);f.mqtt.service(true);
+    now=100;f.mqtt.service(true);
+    resolveDns(0x3201A8C0); // Old lookup must not connect with the new settings.
+    f.mqtt.service(true);
+    assert(dnsCalls==2 && f.client.connections==0);
+    resolveDns(0x3301A8C0);
+    f.mqtt.service(true);
+    assert(f.client.connections==1 && f.client.host=="192.168.1.51");
   }
   puts("All MQTT connection and command integration tests passed.");
 }

@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <AsyncMqttClient.h>
+#include <IPAddress.h>
+#include <lwip/dns.h>
 #include "mqtt_commands.h"
 #include "mqtt_discovery.h"
 #include "target_move.h"
@@ -42,8 +44,13 @@ class DeskMqtt {
   uint32_t lastStateCheckMs_ = 0, lastStateSentMs_ = 0, height_ = 0, manualId_ = 0;
   uint32_t accepted_ = 0, rejected_ = 0, seenRejected_ = 0;
   const char *error_ = "", *commandError_ = "", *lastCommand_ = "none";
+  IPAddress resolvedAddress_;
+  bool tcpStarted_ = false, dnsPending_ = false, dnsReady_ = false, dnsFailed_ = false;
+  uint32_t generation_ = 0, dnsGeneration_ = 0;
 
   void setupClient();
+  bool resolveAddress();
+  static void dnsResult(const char *, const ip_addr_t *address, void *argument);
   void reset(uint32_t now);
   void fail(const char *why, uint32_t now);
   void execute(const MqttCommand &command, uint32_t now);
