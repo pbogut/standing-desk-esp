@@ -80,6 +80,48 @@ int main() {
   bridge.forward(failure, 1030);
   assert(bridge.writeFailures == 1 && bridge.bytesForwarded == forwarded);
 
+  // Physical wake-up bytes pass immediately while idle, even if a packet is
+  // short, corrupt, or split across loop iterations. Timeout never repeats them.
+  {
+    PanelBridge remote;
+    FakeSerial serial;
+    input(remote, serial, {0xA5}, 1000);
+    assert((serial.output == std::vector<uint8_t>{0xA5}));
+    input(remote, serial, {0, 0x20}, 1001);
+    assert((serial.output == std::vector<uint8_t>{0xA5, 0, 0x20}));
+    remote.forward(serial, 1031);
+    assert((serial.output == std::vector<uint8_t>{0xA5, 0, 0x20}));
+    assert(remote.partialTimeouts == 1);
+    input(remote, serial, {0xA5, 0x99, 0xA5, 0, 0x40}, 1040);
+    assert(serial.output == serial.input);
+    input(remote, serial, {0, 0x40}, 1041);
+    assert(serial.output == serial.input && remote.invalidFrames == 1);
+    assert(remote.bytesReceived == remote.bytesForwarded);
+  }
+
+  // A request arriving after a physical frame's prefix was forwarded must finish
+  // that frame before injecting. It cannot suppress/duplicate its remaining bytes.
+  {
+    PanelBridge remote;
+    FakeSerial serial;
+    idle(remote, serial, 0);
+    serial.output.clear();
+    input(remote, serial, {0xA5, 0}, 10);
+    assert((serial.output == std::vector<uint8_t>{0xA5, 0}));
+    assert(remote.start(0x02, false, 10));
+    remote.forward(serial, 10);
+    assert(serial.output.size() == 2);
+    input(remote, serial, {0}, 11);
+    assert((serial.output == std::vector<uint8_t>{0xA5, 0, 0}));
+    input(remote, serial, {0, 0}, 12);
+    expectPackets(serial.output, {0, 0x02});
+    idle(remote, serial, 20);
+    assert(remote.bytesSuppressed == 5);
+    input(remote, serial, packet(0x40), 21);
+    expectPackets(serial.output, {0, 0x02, 0, 0x40});
+    assert(remote.commandButton == 0);
+  }
+
   // Only supported commands can start; recent physical presses block them.
   {
     PanelBridge remote;

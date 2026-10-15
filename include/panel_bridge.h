@@ -104,8 +104,8 @@ class PanelBridge {
       ++inputInterruptions;
       panelIdle_ = aligned_ = false;
       cancel(now, "partial_panel_frame");
-      writeBytes(port, frame_, used_, false);
-      used_ = 0;
+      forwardThrough(port, used_);
+      used_ = forwarded_ = 0;
     }
     // Bound RX processing; never insert a command inside a panel frame.
     for (unsigned count = 0; count < bytesPerPass && port.available(); ++count) {
@@ -122,8 +122,14 @@ class PanelBridge {
         continue;
       }
       frame_[used_++] = static_cast<uint8_t>(byte);
+      // Idle passthrough must preserve wake-up traffic without waiting for a
+      // full frame. Parse a copy for arbitration, tracking bytes already sent.
+      if ((!commandButton && !releasePending_) || forwarded_)
+        if (!forwardThrough(port, used_)) cancel(now, "write_failure");
       if (used_ == sizeof(frame_)) processFrame(port, now);
     }
+    if ((!commandButton && !releasePending_) || forwarded_)
+      if (!forwardThrough(port, used_)) cancel(now, "write_failure");
     // Drain queued physical traffic first. A receive gap also permits release
     // after malformed/truncated traffic, without inserting into its payload.
     if (port.available() || used_ || (bytesReceived && !aligned_
@@ -141,7 +147,7 @@ class PanelBridge {
   }
 
  private:
-  uint8_t frame_[5] = {}, used_ = 0;
+  uint8_t frame_[5] = {}, used_ = 0, forwarded_ = 0;
   bool panelIdle_ = false, aligned_ = false, hold_ = false;
   bool target_ = false;
   bool pressSent_ = false, releasePending_ = false, hasEnded_ = false;
@@ -185,6 +191,14 @@ class PanelBridge {
   }
 
   template <typename SerialPort>
+  bool forwardThrough(SerialPort &port, unsigned end) {
+    if (end <= forwarded_) return true;
+    const bool ok = writeBytes(port, frame_ + forwarded_, end - forwarded_, false);
+    forwarded_ = end;
+    return ok;
+  }
+
+  template <typename SerialPort>
   bool writeCommand(SerialPort &port, uint8_t button, uint32_t now) {
     const uint8_t command[] = {0xA5, 0, button, 0, button};
     lastTxMs_ = now;
@@ -202,7 +216,8 @@ class PanelBridge {
       // Forward corrupt bytes unchanged, retaining an embedded candidate header.
       unsigned next = 1;
       while (next < used_ && frame_[next] != 0xA5) ++next;
-      writeBytes(port, frame_, next, false);
+      forwardThrough(port, next);
+      forwarded_ = forwarded_ > next ? forwarded_ - next : 0;
       used_ -= next;
       memmove(frame_, frame_ + next, used_);
       return;
@@ -220,16 +235,16 @@ class PanelBridge {
         if (!releasePending_) endedMs_ = now;
       }
     }
-    if (panelIdle_ && commandButton) {
+    if (panelIdle_ && commandButton && !forwarded_) {
       bytesSuppressed += sizeof(frame_);
     } else {
-      const bool ok = writeBytes(port, frame_, sizeof(frame_), false);
+      const bool ok = forwardThrough(port, sizeof(frame_));
       if (panelIdle_ && ok && releasePending_) {
         releasePending_ = false;
         endedMs_ = now;
       }
       if (!ok) cancel(now, "write_failure");
     }
-    used_ = 0;
+    used_ = forwarded_ = 0;
   }
 };
